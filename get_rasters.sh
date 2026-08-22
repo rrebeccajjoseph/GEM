@@ -5,8 +5,10 @@ set -e
 
 mkdir -p data/rasters/koppen_geiger data/rasters/pop_density
 
-curl -L -o data/rasters/koppen_geiger/Beck_KG_V1.zip \
-    https://figshare.com/ndownloader/files/12407516
+# Note: the figshare.com/ndownloader host answers curl with an empty
+# HTTP 202; ndownloader.figshare.com serves the file directly.
+curl -fL --retry 5 --retry-all-errors -o data/rasters/koppen_geiger/Beck_KG_V1.zip \
+    https://ndownloader.figshare.com/files/12407516
 unzip -o data/rasters/koppen_geiger/Beck_KG_V1.zip -d data/rasters/koppen_geiger
 
 curl -L -o data/rasters/pop_density/ghsl.zip \
