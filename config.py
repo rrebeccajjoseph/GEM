@@ -1,9 +1,12 @@
+import os
 from transformers import TrainingArguments
 
 # Image data & metadata paths
 
-# OpenAI's pretrained implementation
-CLIP_MODEL = 'openai/clip-vit-large-patch14-336'
+# OpenAI's pretrained implementation. Override via PIGEON_CLIP_MODEL to swap
+# encoders, e.g. PIGEON_CLIP_MODEL=geolocal/StreetCLIP (the authors' public
+# caption-pretrained checkpoint, same ViT-L/14-336 architecture).
+CLIP_MODEL = os.environ.get('PIGEON_CLIP_MODEL', 'openai/clip-vit-large-patch14-336')
 CLIP_EMBED_DIM = 1024
 
 ### StreetView
@@ -21,6 +24,20 @@ IMAGE_PATH_YFCC = 'data/images_mp_16/jpgs'
 ### Landmarks
 METADATA_PATH_LANDMARKS = 'data/data_landmarks_aug.csv'
 IMAGE_PATH_LANDMARKS = 'data/benchmarks/google_landmark/jpgs'
+
+### OSV-5M (Astruc et al., CVPR 2024) — shared data spine for the PIGEON
+### retrain control and the energy model. See dataset_creation/osv5m.py.
+OSV5M_HF_REPO = 'osv5m/osv5m'
+OSV5M_ROOT = 'data/osv5m'
+METADATA_PATH_OSV = 'data/osv5m/metadata_osv5m.csv'
+IMAGE_PATH_OSV = 'data/osv5m/images'
+GEOCELL_PATH_OSV = 'data/geocells_osv5m.csv'
+DATASET_PATH_OSV = 'data/hf_OSV5M'
+SCALER_PATH_OSV = 'saved_models/scaler/regression_osv5m.scaler'
+PROTO_PATH_OSV = 'data/data_prototypes_osv5m.csv'
+PROTO_MODEL_OSV_PATH = 'saved_models/refiner/proto_osv5m.refiner'
+PRETRAINED_CLIP_OSV = 'saved_models/StreetCLIP_osv5m.model'
+CLIP_PRETRAINED_HEAD_OSV = 'saved_models/OSV5M_head.model'
 
 # Political boundaries
 COUNTRY_PATH = 'data/geocells/countries.geojson'
@@ -89,6 +106,22 @@ PROTO_MODEL_LANDMARKS_PATH = 'saved_models/refiner/proto_landmarks.refiner'
 
 # Benchmark Eval Paths
 BENCHMARKS = 'data/benchmarks/benchmarks.json'
+
+# OSV-5M rides the PIGEOTTO (--yfcc) code path with its artifact paths
+# rebound here, so no module outside config.py needs a third dataset branch.
+# run.py sets PIGEON_DATASET=osv5m when invoked with --osv; every module reads
+# these constants from config, so rebinding at import time covers them all.
+if os.environ.get('PIGEON_DATASET', '').lower() == 'osv5m':
+    METADATA_PATH_YFCC = METADATA_PATH_OSV
+    PRETRAIN_METADATA_PATH_YFCC = METADATA_PATH_OSV
+    IMAGE_PATH_YFCC = IMAGE_PATH_OSV
+    GEOCELL_PATH_YFCC = GEOCELL_PATH_OSV
+    DATASET_PATH_YFCC = DATASET_PATH_OSV
+    SCALER_PATH_YFCC = SCALER_PATH_OSV
+    PROTO_PATH_YFCC = PROTO_PATH_OSV
+    PROTO_MODEL_YFCC_PATH = PROTO_MODEL_OSV_PATH
+    PRETRAINED_CLIP_YFCC = PRETRAINED_CLIP_OSV
+    CLIP_PRETRAINED_HEAD_YFCC = CLIP_PRETRAINED_HEAD_OSV
 
 # Training arguments --> RUN ON 4 GPUs
 TRAIN_ARGS = TrainingArguments(

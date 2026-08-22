@@ -1,4 +1,11 @@
 import os
+import sys
+
+# Must run before config is imported (transitively, via the imports below):
+# --osv rebinds the PIGEOTTO (YFCC) artifact paths in config.py to OSV-5M.
+if '--osv' in sys.argv:
+    os.environ['PIGEON_DATASET'] = 'osv5m'
+
 import torch
 import argparse
 import logging
@@ -86,6 +93,13 @@ argp.add_argument('--yfcc',
     default=False
 )
 
+argp.add_argument('--osv',
+    help='Set flag to train with OSV-5M data (rides the YFCC/PIGEOTTO code path '
+         'with OSV-5M paths rebound in config.py).',
+    action='store_true',
+    default=False
+)
+
 argp.add_argument('--landmarks',
     help='Set flag if landmark data was added to the training mix.',
     action='store_true',
@@ -96,6 +110,15 @@ def main():
 
     # Setup
     args = argp.parse_args()
+    if args.osv and args.yfcc:
+        raise ValueError('--osv and --yfcc are mutually exclusive.')
+
+    # OSV-5M is single-image data trained with PIGEOTTO settings, so it takes
+    # the YFCC branches everywhere below; config.py has already rebound the
+    # YFCC artifact paths to their OSV-5M equivalents (see top of this file).
+    if args.osv:
+        args.yfcc = True
+
     mode = 'classification' if args.classification else 'regression'
     logger.warning(f'Task: {args.function.capitalize()} Pigeon(\"{args.name}\") via geospatial {mode}.')
 
@@ -126,7 +149,10 @@ def main():
         if args.function == 'embed':
             if 'vit' not in args.name:
                 print('Using CLIP embedder.')
-                embedder = CLIPEmbedding(args.name, load_checkpoint=True, panorama=(not args.yfcc))
+                # Only local state-dict paths are loadable checkpoints; otherwise
+                # the encoder is CLIP_MODEL from config (override via PIGEON_CLIP_MODEL).
+                embedder = CLIPEmbedding(args.name, load_checkpoint=os.path.isfile(args.name),
+                                         panorama=(not args.yfcc))
             else:
                 print('Using ViT embedder.')
                 embedder = VITEmbedding(args.named)
