@@ -170,14 +170,13 @@ def main():
                 loss = info_nce(model, f, y_latlng)
             else:
                 nll, _, _ = exact_nll(model, f, y_idx, grid_rff,
-                                      target_latlng=y_latlng,
                                       chunk_size=args.chunk_size,
                                       checkpoint_chunks=args.checkpoint_chunks)
                 loss = nll.mean()
 
                 if args.masks > 1:
                     warm = min(1.0, global_step / max(args.warmup_steps, 1))
-                    loc_emb_t = model.location_tower(y_latlng)
+                    loc_emb_t = model.location_tower.forward_features(grid_rff[y_idx])
                     r = model.routing_posterior(f, loc_emb_t)
                     regs = routing_regularizers(r, model.image_tower.gates())
                     loss = loss + warm * args.mu_conf * regs['confidence'] \

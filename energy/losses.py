@@ -15,13 +15,18 @@ from torch.utils.checkpoint import checkpoint
 
 
 def exact_nll(model, f: Tensor, target_idx: Tensor, grid_rff: Tensor,
-              target_latlng: Tensor=None, chunk_size: int=32768,
-              checkpoint_chunks: bool=False):
+              chunk_size: int=32768, checkpoint_chunks: bool=False):
     """Exact negative log-likelihood: F(x, y*) + log Z(x).
 
     The location tower runs over the FULL grid in-graph every call — the
     negative-phase gradient for the location tower flows through log Z, and
     detaching or caching the grid embeddings silently removes it.
+
+    y* is ALWAYS the snapped cell centroid. Scoring the positive phase at the
+    exact coordinate while Z sums over centroids makes the objective
+    unbounded below (the target point is outside the normalization support,
+    so the model can spike -F there indefinitely) — training diverges within
+    a few hundred steps. Sub-cell placement belongs to Stage E, not here.
 
     Args:
         model (EnergyModel): the model
@@ -29,8 +34,6 @@ def exact_nll(model, f: Tensor, target_idx: Tensor, grid_rff: Tensor,
         target_idx (Tensor): grid cell index of y* [B]
         grid_rff (Tensor): precomputed RFF features of the grid [G, F]
             (fixed encoding — legitimate to precompute; the MLP on top is not)
-        target_latlng (Tensor, optional): exact coordinates [B, 2]; when given,
-            F(x, y*) uses phi(y*) at the true point instead of the cell centroid.
         chunk_size (int, optional): grid cells per chunk.
         checkpoint_chunks (bool, optional): gradient-checkpoint each chunk.
 
@@ -56,11 +59,8 @@ def exact_nll(model, f: Tensor, target_idx: Tensor, grid_rff: Tensor,
 
     log_z = torch.logsumexp(torch.stack(chunk_lses, dim=0), dim=0)      # [B]
 
-    # -F at the target: exact coordinates if given, else the cell centroid
-    if target_latlng is not None:
-        loc_emb_t = model.location_tower(target_latlng)                 # [B, d]
-    else:
-        loc_emb_t = model.location_tower.forward_features(grid_rff[target_idx])
+    # -F at the target cell centroid (see docstring: never the exact point)
+    loc_emb_t = model.location_tower.forward_features(grid_rff[target_idx])  # [B, d]
 
     img_emb = model.image_tower(f)                                      # [B, M, d]
     vis_t = torch.einsum('bmd,bd->bm', img_emb, loc_emb_t) / (model.d ** 0.5)
