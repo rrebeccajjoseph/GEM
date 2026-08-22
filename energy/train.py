@@ -31,7 +31,7 @@ import pandas as pd
 import torch
 
 from energy.model import EnergyModel
-from energy.losses import exact_nll, routing_regularizers, info_nce
+from energy.losses import exact_nll, smoothed_nll, routing_regularizers, info_nce
 from energy.evaluation import evaluate_on_cache
 from energy.grid import build_grid, cell_index_map, snap_to_grid
 
@@ -87,6 +87,10 @@ def main():
     argp.add_argument('--season', action='store_true', default=False)
     argp.add_argument('--contrastive', action='store_true', default=False,
                       help="Ablation 0a': InfoNCE with in-batch negatives.")
+    argp.add_argument('--smooth-tau', type=float, default=None,
+                      help='Ablation A3: haversine label smoothing (their '
+                           'tau=65) on top of the field. Tests whether the '
+                           'hand-designed prior is subsumed by phi.')
     argp.add_argument('--chunk-size', type=int, default=32768)
     argp.add_argument('--checkpoint-chunks', action='store_true', default=False,
                       help='Gradient-checkpoint grid chunks (use when masks > 1).')
@@ -168,6 +172,11 @@ def main():
 
             if args.contrastive:
                 loss = info_nce(model, f, y_latlng)
+            elif args.smooth_tau is not None:
+                loss = smoothed_nll(model, f, y_latlng, grid_latlngs, grid_rff,
+                                    tau=args.smooth_tau,
+                                    chunk_size=args.chunk_size,
+                                    checkpoint_chunks=args.checkpoint_chunks).mean()
             else:
                 nll, _, _ = exact_nll(model, f, y_idx, grid_rff,
                                       chunk_size=args.chunk_size,

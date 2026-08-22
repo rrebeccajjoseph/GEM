@@ -81,6 +81,61 @@ def exact_nll(model, f: Tensor, target_idx: Tensor, grid_rff: Tensor,
     return nll, neg_f_t, log_z
 
 
+def haversine_km_torch(a: Tensor, b: Tensor) -> Tensor:
+    """Geodesic km between [N, 2] and [M, 2] (lat, lng) degrees -> [N, M]."""
+    a, b = torch.deg2rad(a), torch.deg2rad(b)
+    lat1, lat2 = a[:, 0:1], b[None, :, 0]
+    dlat = lat2 - lat1
+    dlng = b[None, :, 1] - a[:, 1:2]
+    h = torch.sin(dlat / 2) ** 2 + \
+        torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlng / 2) ** 2
+    return 2 * 6371.0 * torch.asin(torch.sqrt(torch.clamp(h, 0, 1)))
+
+
+def smoothed_nll(model, f: Tensor, target_latlng: Tensor, grid_latlng: Tensor,
+                 grid_rff: Tensor, tau: float=65.0, chunk_size: int=32768,
+                 checkpoint_chunks: bool=False) -> Tensor:
+    """Ablation A3: PIGEON's haversine label smoothing on top of the field.
+
+    Soft targets over the grid, q(g) ∝ exp(-(d(g, y*) - d_min)/tau) — the
+    exact formula from preprocessing/utils.py smooth_labels with tau =
+    LABEL_SMOOTHING_CONSTANT (65 for PIGEOTTO), except q is normalized here
+    so the loss is a proper cross-entropy (their unnormalized variant scales
+    the loss by sum(q); the gradient direction is identical).
+
+    Loss = -sum_g q(g) log p(g) = log Z - sum_g q(g) (-F(g)).
+
+    Returns:
+        Tensor: loss per sample [B]
+    """
+    G = grid_rff.shape[0]
+    with torch.no_grad():
+        dist = haversine_km_torch(target_latlng, grid_latlng)       # [B, G]
+        q = torch.softmax(-(dist - dist.min(dim=1, keepdim=True).values) / tau,
+                          dim=1)
+
+    def chunk_terms(rff_chunk: Tensor, q_chunk: Tensor, start: int):
+        loc_emb = model.location_tower.forward_features(rff_chunk)
+        neg_f = model.neg_free_energy(f, loc_emb,
+                                      grid_slice=slice(start, start + rff_chunk.shape[0]))
+        return torch.logsumexp(neg_f, dim=1), (q_chunk * neg_f).sum(dim=1)
+
+    lses, weighted = [], []
+    for start in range(0, G, chunk_size):
+        rff_chunk = grid_rff[start:start + chunk_size]
+        q_chunk = q[:, start:start + rff_chunk.shape[0]]
+        if checkpoint_chunks and torch.is_grad_enabled():
+            lse, w = checkpoint(chunk_terms, rff_chunk, q_chunk, start,
+                                use_reentrant=False)
+        else:
+            lse, w = chunk_terms(rff_chunk, q_chunk, start)
+        lses.append(lse)
+        weighted.append(w)
+
+    log_z = torch.logsumexp(torch.stack(lses, dim=0), dim=0)
+    return log_z - torch.stack(weighted, dim=0).sum(dim=0)
+
+
 def routing_regularizers(r: Tensor, gates: Tensor):
     """Mask routing regularizers (Stage D).
 

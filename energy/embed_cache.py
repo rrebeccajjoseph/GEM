@@ -76,7 +76,9 @@ def main():
 
     meta = pd.read_csv(args.metadata, dtype={'id': str})
     keep = ['id', 'lat', 'lng', 'month', 'selection']
-    keep += [c for c in ['climate_zone', 'drive_side'] if c in meta.columns]
+    aux = ['climate_zone', 'drive_side', 'elevation_reg', 'population_reg',
+           'temp_avg_reg', 'temp_diff_reg', 'prec_avg_reg', 'prec_diff_reg']
+    keep += [c for c in aux if c in meta.columns]
     meta[keep].to_csv(os.path.join(args.out, 'index.csv'), index=False)
 
     n = len(meta)
