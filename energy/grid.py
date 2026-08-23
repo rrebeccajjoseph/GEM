@@ -151,9 +151,20 @@ class RasterioSampler:
         self.band = band
         self.nodata = nodata if nodata is not None else self.dataset.nodata
         self.transform_value = transform_value
+        # Reproject query points when the raster is not in EPSG:4326 —
+        # GHSL is Mollweide (ESRI:54009); sampling it with raw geographic
+        # coordinates silently returns nodata everywhere.
+        self.needs_reproject = (self.dataset.crs is not None
+                                and self.dataset.crs.to_string() != 'EPSG:4326')
 
     def __call__(self, lats: np.ndarray, lngs: np.ndarray) -> np.ndarray:
-        coords = list(zip(lngs, lats))  # rasterio expects (x, y)
+        if self.needs_reproject:
+            from rasterio.warp import transform as warp_transform
+            xs, ys = warp_transform('EPSG:4326', self.dataset.crs,
+                                    list(lngs), list(lats))
+            coords = list(zip(xs, ys))
+        else:
+            coords = list(zip(lngs, lats))  # rasterio expects (x, y)
         vals = np.array([v[self.band - 1] for v in self.dataset.sample(coords)],
                         dtype=np.float64)
         if self.nodata is not None:
