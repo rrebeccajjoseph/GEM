@@ -27,7 +27,9 @@ project_dir = os.path.dirname(script_dir)
 if project_dir not in sys.path:
     sys.path.append(project_dir)
 
+import copy
 import json
+import math
 import logging
 import argparse
 import numpy as np
@@ -128,6 +130,8 @@ def train_pigeon_lite(embeddings, latlngs: np.ndarray, train_rows: np.ndarray,
     rng = np.random.default_rng(seed)
     history = []
     global_step = 0
+    best_metric, best_epoch = math.inf, -1
+    best_state = copy.deepcopy(model.state_dict())
     for epoch in range(epochs):
         model.train()
         order = rng.permutation(len(train_rows))
@@ -168,6 +172,15 @@ def train_pigeon_lite(embeddings, latlngs: np.ndarray, train_rows: np.ndarray,
             wandb.log({f'epoch/{k}': v for k, v in record.items()},
                       step=global_step)
 
+        cur = record.get('median_km')
+        if cur is not None and cur < best_metric:
+            best_metric, best_epoch = cur, epoch
+            best_state = copy.deepcopy(model.state_dict())
+
+    # Return the best epoch by val median_km, not the last — keeps the saved
+    # control model consistent with train.py's {run_name}.pt.
+    model.load_state_dict(best_state)
+    logger.info(f'Best epoch {best_epoch} (median_km {best_metric:.3f}).')
     return model, centroids_np, history
 
 

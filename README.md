@@ -47,3 +47,8 @@ python -m energy.refine --coarse saved_models/energy/stage_d.pt   # Stage E
 python -m energy.pigeon_lite                              # control row
 python -m energy.benchmark --coarse ... --refiner ... --benchmark im2gps3k
 ```
+
+`energy.train` writes two checkpoints per run: `{run_name}.pt` is the best
+epoch by validation median_km (this is what `--init-from` and eval should
+use), and `{run_name}_last.pt` is the final epoch, kept for inspecting
+divergence.

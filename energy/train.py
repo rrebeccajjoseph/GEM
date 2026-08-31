@@ -183,6 +183,8 @@ def main():
     rng = np.random.default_rng(330)
     global_step = 0
     history = []
+    best_metric = math.inf  # lowest val median_km so far; {run_name}.pt tracks it
+    best_epoch = -1
     for epoch in range(args.epochs):
         model.train()
         order = rng.permutation(splits['train'])
@@ -268,12 +270,27 @@ def main():
             wandb.log({f'epoch/{k}': v for k, v in record.items() if k != 'epoch'},
                       step=global_step)
 
-        torch.save({'model': model.state_dict(), 'args': vars(args), 'epoch': epoch},
-                   os.path.join(args.out, f'{args.run_name}.pt'))
+        ckpt = {'model': model.state_dict(), 'args': vars(args), 'epoch': epoch}
+        torch.save(ckpt, os.path.join(args.out, f'{args.run_name}_last.pt'))
+
+        # {run_name}.pt is the best epoch by val median_km (lower is better), not
+        # the last one — a diverging run (0a' contrastive collapses after ep 1)
+        # would otherwise leave the worst checkpoint behind for chaining/eval.
+        cur = record.get('median_km')
+        if cur is None or cur < best_metric:
+            if cur is not None:
+                best_metric = cur
+            best_epoch = epoch
+            torch.save({**ckpt, 'best_epoch': best_epoch, 'best_median_km': best_metric},
+                       os.path.join(args.out, f'{args.run_name}.pt'))
+            logger.info(f'New best checkpoint: epoch {epoch}, median_km {cur}.')
+
         with open(os.path.join(args.out, f'{args.run_name}_history.json'), 'w') as fh:
             json.dump(history, fh, indent=2)
 
-    logger.info('Training complete.')
+    logger.info(f'Training complete. Best epoch {best_epoch} '
+                f'(median_km {best_metric:.3f}) -> {args.run_name}.pt; '
+                f'last epoch -> {args.run_name}_last.pt.')
     if wandb_run is not None:
         wandb.finish()
 
