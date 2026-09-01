@@ -103,10 +103,35 @@ def main():
                       help='Checkpoint to initialize from (stage chaining).')
     argp.add_argument('--eval-samples', type=int, default=20000,
                       help='Val rows used for the per-epoch metric pass.')
+    argp.add_argument('--wandb', action='store_true', default=False,
+                      help='Log training curves to Weights & Biases.')
+    argp.add_argument('--wandb-project', default='spherical-pigeon')
+    argp.add_argument('--wandb-entity', default=None)
+    argp.add_argument('--wandb-mode', default='online', choices=['online', 'offline', 'disabled'],
+                      help="Use 'offline' on compute nodes with no outbound internet "
+                           "(e.g. Delta GPU nodes); sync afterwards with `wandb sync <dir>`.")
+    argp.add_argument('--wandb-log-every', type=int, default=50,
+                      help='Log a step-level training-loss point every N optimizer steps '
+                           '(epochs over 5M rows are hours long — per-epoch-only logging '
+                           'would leave the live graph flat for most of a run).')
     args = argp.parse_args()
 
     device = pick_device()
     logger.info(f'Device: {device}.')
+
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb
+        except ImportError:
+            raise SystemExit('--wandb given but the wandb package is not installed '
+                              '(pip install wandb).')
+        os.environ['WANDB_MODE'] = args.wandb_mode
+        wandb_run = wandb.init(project=args.wandb_project, entity=args.wandb_entity,
+                               name=args.run_name, config=vars(args))
+        if args.wandb_mode == 'offline':
+            logger.info(f'W&B in offline mode, writing to {wandb_run.dir}. '
+                        f'Sync later with: wandb sync {os.path.dirname(wandb_run.dir)}')
 
     # Grid
     latlngs_np, resolution, raster_table = load_grid(args.grid, args.rasters)
@@ -158,7 +183,8 @@ def main():
     rng = np.random.default_rng(330)
     global_step = 0
     history = []
-
+    best_metric = math.inf  # lowest val median_km so far; {run_name}.pt tracks it
+    best_epoch = -1
     for epoch in range(args.epochs):
         model.train()
         order = rng.permutation(splits['train'])
@@ -194,13 +220,19 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
 
             epoch_loss += loss.item() * len(rows)
             epoch_n += len(rows)
             global_step += 1
+
+            if wandb_run is not None and global_step % args.wandb_log_every == 0:
+                wandb.log({'train/loss_step': loss.item(),
+                           'train/grad_norm': float(grad_norm),
+                           'train/lr': scheduler.get_last_lr()[0],
+                           'epoch': epoch}, step=global_step)
 
         train_loss = epoch_loss / epoch_n
 
@@ -234,12 +266,33 @@ def main():
         history.append(record)
         logger.info(json.dumps(record))
 
-        torch.save({'model': model.state_dict(), 'args': vars(args), 'epoch': epoch},
-                   os.path.join(args.out, f'{args.run_name}.pt'))
+        if wandb_run is not None:
+            wandb.log({f'epoch/{k}': v for k, v in record.items() if k != 'epoch'},
+                      step=global_step)
+
+        ckpt = {'model': model.state_dict(), 'args': vars(args), 'epoch': epoch}
+        torch.save(ckpt, os.path.join(args.out, f'{args.run_name}_last.pt'))
+
+        # {run_name}.pt is the best epoch by val median_km (lower is better), not
+        # the last one — a diverging run (0a' contrastive collapses after ep 1)
+        # would otherwise leave the worst checkpoint behind for chaining/eval.
+        cur = record.get('median_km')
+        if cur is None or cur < best_metric:
+            if cur is not None:
+                best_metric = cur
+            best_epoch = epoch
+            torch.save({**ckpt, 'best_epoch': best_epoch, 'best_median_km': best_metric},
+                       os.path.join(args.out, f'{args.run_name}.pt'))
+            logger.info(f'New best checkpoint: epoch {epoch}, median_km {cur}.')
+
         with open(os.path.join(args.out, f'{args.run_name}_history.json'), 'w') as fh:
             json.dump(history, fh, indent=2)
 
-    logger.info('Training complete.')
+    logger.info(f'Training complete. Best epoch {best_epoch} '
+                f'(median_km {best_metric:.3f}) -> {args.run_name}.pt; '
+                f'last epoch -> {args.run_name}_last.pt.')
+    if wandb_run is not None:
+        wandb.finish()
 
 
 if __name__ == '__main__':
