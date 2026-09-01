@@ -107,7 +107,7 @@ def train_pigeon_lite(embeddings, latlngs: np.ndarray, train_rows: np.ndarray,
                       val_rows: np.ndarray, max_cell: int=2000,
                       min_cell: int=1000, tau: float=65.0, epochs: int=20,
                       batch_size: int=256, lr: float=1e-3, device: str='cpu',
-                      hard_labels: bool=False, seed: int=330):
+                      hard_labels: bool=False, seed: int=330, wandb_run=None):
     """Trains the control classifier; returns (model, centroids, history).
 
     hard_labels=True disables smoothing — the within-control ablation of
@@ -127,6 +127,7 @@ def train_pigeon_lite(embeddings, latlngs: np.ndarray, train_rows: np.ndarray,
 
     rng = np.random.default_rng(seed)
     history = []
+    global_step = 0
     for epoch in range(epochs):
         model.train()
         order = rng.permutation(len(train_rows))
@@ -151,12 +152,21 @@ def train_pigeon_lite(embeddings, latlngs: np.ndarray, train_rows: np.ndarray,
             sched.step()
             epoch_loss += loss.item() * len(sel)
             n_seen += len(sel)
+            global_step += 1
 
         metrics = evaluate_pigeon_lite(model, embeddings, latlngs, val_rows,
                                        centroids_np, device=device)
         record = {'epoch': epoch, 'train_loss': epoch_loss / n_seen, **metrics}
         history.append(record)
         logger.info(json.dumps(record))
+        if wandb_run is not None:
+            import wandb
+            # step=global_step (batch count), not epoch — train.py's runs share
+            # this same "Step" x-axis via their own global_step, so overlaying
+            # a pigeon_lite run on the same W&B panel plots comparably instead
+            # of collapsing to a single point near step=0..epochs.
+            wandb.log({f'epoch/{k}': v for k, v in record.items()},
+                      step=global_step)
 
     return model, centroids_np, history
 
@@ -189,6 +199,11 @@ def main():
     argp.add_argument('--epochs', type=int, default=20)
     argp.add_argument('--batch-size', type=int, default=256)
     argp.add_argument('--lr', type=float, default=1e-3)
+    argp.add_argument('--wandb', action='store_true', default=False,
+                      help='Log training curves to Weights & Biases.')
+    argp.add_argument('--wandb-project', default='spherical-pigeon')
+    argp.add_argument('--wandb-entity', default=None)
+    argp.add_argument('--wandb-mode', default='online', choices=['online', 'offline', 'disabled'])
     args = argp.parse_args()
 
     device = pick_device()
@@ -197,11 +212,22 @@ def main():
     splits = {name: np.flatnonzero((index['selection'] == name).values)
               for name in ['train', 'val']}
 
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb
+        except ImportError:
+            raise SystemExit('--wandb given but the wandb package is not installed '
+                              '(pip install wandb).')
+        os.environ['WANDB_MODE'] = args.wandb_mode
+        wandb_run = wandb.init(project=args.wandb_project, entity=args.wandb_entity,
+                               name=args.run_name, config=vars(args))
+
     model, centroids, history = train_pigeon_lite(
         embeddings, latlngs, splits['train'], splits['val'],
         max_cell=args.max_cell, min_cell=args.min_cell, tau=args.tau,
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
-        device=device, hard_labels=args.hard_labels)
+        device=device, hard_labels=args.hard_labels, wandb_run=wandb_run)
 
     os.makedirs(args.out, exist_ok=True)
     torch.save({'model': model.state_dict(), 'centroids': centroids,
@@ -209,6 +235,9 @@ def main():
                os.path.join(args.out, f'{args.run_name}.pt'))
     with open(os.path.join(args.out, f'{args.run_name}_history.json'), 'w') as fh:
         json.dump(history, fh, indent=2)
+
+    if wandb_run is not None:
+        wandb.finish()
 
 
 if __name__ == '__main__':
