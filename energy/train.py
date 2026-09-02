@@ -312,6 +312,21 @@ def main():
 
         ckpt = {'model': model.state_dict(), 'args': vars(args), 'epoch': epoch}
 
+        # {run_name}.pt is the best epoch by val median_km (lower is better), not
+        # the last one — a diverging run (0a' contrastive collapses after ep 1)
+        # would otherwise leave the worst checkpoint behind for chaining/eval.
+        # Do this first so {run_name}_last.pt below records the updated best_*.
+        cur = record.get('median_km')
+        if cur is None or cur < best_metric:
+            if cur is not None:
+                best_metric = cur
+            best_epoch = epoch
+            best_path = os.path.join(args.out, f'{args.run_name}.pt')
+            torch.save({**ckpt, 'best_epoch': best_epoch, 'best_median_km': best_metric},
+                       best_path + '.tmp')
+            os.replace(best_path + '.tmp', best_path)
+            logger.info(f'New best checkpoint: epoch {epoch}, median_km {cur}.')
+
         # {run_name}_last.pt carries the full training state so a preempted job
         # requeued onto a *-preempt partition resumes with --resume instead of
         # restarting from epoch 0. Written via a temp file + os.replace so a
@@ -323,20 +338,6 @@ def main():
         last_path = os.path.join(args.out, f'{args.run_name}_last.pt')
         torch.save(full, last_path + '.tmp')
         os.replace(last_path + '.tmp', last_path)
-
-        # {run_name}.pt is the best epoch by val median_km (lower is better), not
-        # the last one — a diverging run (0a' contrastive collapses after ep 1)
-        # would otherwise leave the worst checkpoint behind for chaining/eval.
-        cur = record.get('median_km')
-        if cur is None or cur < best_metric:
-            if cur is not None:
-                best_metric = cur
-            best_epoch = epoch
-            best_path = os.path.join(args.out, f'{args.run_name}.pt')
-            torch.save({**ckpt, 'best_epoch': best_epoch, 'best_median_km': best_metric},
-                       best_path + '.tmp')
-            os.replace(best_path + '.tmp', best_path)
-            logger.info(f'New best checkpoint: epoch {epoch}, median_km {cur}.')
 
         hist_path = os.path.join(args.out, f'{args.run_name}_history.json')
         with open(hist_path + '.tmp', 'w') as fh:
