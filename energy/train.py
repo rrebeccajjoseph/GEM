@@ -24,6 +24,7 @@ if project_dir not in sys.path:
 
 import json
 import math
+import hashlib
 import logging
 import argparse
 import numpy as np
@@ -101,12 +102,47 @@ def main():
                       help='Anneal mu_conf and mu_bal from 0 over this many steps.')
     argp.add_argument('--init-from', default=None,
                       help='Checkpoint to initialize from (stage chaining).')
+    argp.add_argument('--resume', default=None,
+                      help='Resume a run from its {run_name}_last.pt: restores model, '
+                           'optimizer, LR scheduler, epoch, step, RNG and history, and '
+                           'skips completed epochs. Missing file = start fresh (so a '
+                           'requeued preempted job can always pass this). Mutually '
+                           'exclusive with --init-from.')
     argp.add_argument('--eval-samples', type=int, default=20000,
                       help='Val rows used for the per-epoch metric pass.')
+    argp.add_argument('--wandb', action='store_true', default=False,
+                      help='Log training curves to Weights & Biases.')
+    argp.add_argument('--wandb-project', default='spherical-pigeon')
+    argp.add_argument('--wandb-entity', default=None)
+    argp.add_argument('--wandb-mode', default='online', choices=['online', 'offline', 'disabled'],
+                      help="Use 'offline' on compute nodes with no outbound internet "
+                           "(e.g. Delta GPU nodes); sync afterwards with `wandb sync <dir>`.")
+    argp.add_argument('--wandb-log-every', type=int, default=50,
+                      help='Log a step-level training-loss point every N optimizer steps '
+                           '(epochs over 5M rows are hours long — per-epoch-only logging '
+                           'would leave the live graph flat for most of a run).')
     args = argp.parse_args()
 
     device = pick_device()
     logger.info(f'Device: {device}.')
+
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb
+        except ImportError:
+            raise SystemExit('--wandb given but the wandb package is not installed '
+                              '(pip install wandb).')
+        os.environ['WANDB_MODE'] = args.wandb_mode
+        # Deterministic id from run_name so a requeued (preempted) job reattaches
+        # to the same W&B run instead of spawning a duplicate.
+        wandb_id = hashlib.md5(args.run_name.encode()).hexdigest()[:16]
+        wandb_run = wandb.init(project=args.wandb_project, entity=args.wandb_entity,
+                               name=args.run_name, id=wandb_id, resume='allow',
+                               config=vars(args))
+        if args.wandb_mode == 'offline':
+            logger.info(f'W&B in offline mode, writing to {wandb_run.dir}. '
+                        f'Sync later with: wandb sync {os.path.dirname(wandb_run.dir)}')
 
     # Grid
     latlngs_np, resolution, raster_table = load_grid(args.grid, args.rasters)
@@ -129,6 +165,8 @@ def main():
     # Model
     model = EnergyModel(in_dim=embeddings.shape[1], d=args.d, n_masks=args.masks,
                         raster_table=raster_table, use_season=args.season).to(device)
+    if args.init_from and args.resume:
+        raise SystemExit('--init-from and --resume are mutually exclusive.')
     if args.init_from:
         state = torch.load(args.init_from, map_location=device)
         missing, unexpected = model.load_state_dict(state['model'], strict=False)
@@ -158,8 +196,36 @@ def main():
     rng = np.random.default_rng(330)
     global_step = 0
     history = []
+    best_metric = math.inf  # lowest val median_km so far; {run_name}.pt tracks it
+    best_epoch = -1
+    start_epoch = 0
 
-    for epoch in range(args.epochs):
+    if args.resume and os.path.exists(args.resume):
+        ck = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ck['model'])
+        if ck.get('optimizer') is not None:
+            optimizer.load_state_dict(ck['optimizer'])
+        if ck.get('scheduler') is not None:
+            scheduler.load_state_dict(ck['scheduler'])
+        global_step = ck.get('global_step', 0)
+        history = ck.get('history', [])
+        if ck.get('best_median_km') is not None:
+            best_metric = ck['best_median_km']
+        best_epoch = ck.get('best_epoch', -1)
+        if ck.get('rng') is not None:
+            rng.bit_generator.state = ck['rng']
+        if ck.get('args', {}).get('epochs') not in (None, args.epochs):
+            logger.warning(f"--resume checkpoint was for epochs={ck['args']['epochs']} "
+                           f"but this run has epochs={args.epochs}; the LR schedule "
+                           f"(CosineAnnealingLR T_max) will not line up.")
+        start_epoch = ck.get('epoch', -1) + 1
+        logger.info(f'Resumed from {args.resume}: continuing at epoch {start_epoch}/'
+                    f'{args.epochs} (global_step {global_step}, best epoch {best_epoch}, '
+                    f'best median_km {best_metric}).')
+    elif args.resume:
+        logger.info(f'--resume {args.resume} not found; starting a fresh run.')
+
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         order = rng.permutation(splits['train'])
         epoch_loss, epoch_n = 0.0, 0
@@ -194,13 +260,19 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
 
             epoch_loss += loss.item() * len(rows)
             epoch_n += len(rows)
             global_step += 1
+
+            if wandb_run is not None and global_step % args.wandb_log_every == 0:
+                wandb.log({'train/loss_step': loss.item(),
+                           'train/grad_norm': float(grad_norm),
+                           'train/lr': scheduler.get_last_lr()[0],
+                           'epoch': epoch}, step=global_step)
 
         train_loss = epoch_loss / epoch_n
 
@@ -234,12 +306,52 @@ def main():
         history.append(record)
         logger.info(json.dumps(record))
 
-        torch.save({'model': model.state_dict(), 'args': vars(args), 'epoch': epoch},
-                   os.path.join(args.out, f'{args.run_name}.pt'))
-        with open(os.path.join(args.out, f'{args.run_name}_history.json'), 'w') as fh:
-            json.dump(history, fh, indent=2)
+        if wandb_run is not None:
+            wandb.log({f'epoch/{k}': v for k, v in record.items() if k != 'epoch'},
+                      step=global_step)
 
-    logger.info('Training complete.')
+        ckpt = {'model': model.state_dict(), 'args': vars(args), 'epoch': epoch}
+
+        # {run_name}.pt is the best epoch by val median_km (lower is better), not
+        # the last one — a diverging run (0a' contrastive collapses after ep 1)
+        # would otherwise leave the worst checkpoint behind for chaining/eval.
+        # Do this first so {run_name}_last.pt below records the updated best_*.
+        cur = record.get('median_km')
+        if cur is None or cur < best_metric:
+            if cur is not None:
+                best_metric = cur
+            best_epoch = epoch
+            best_path = os.path.join(args.out, f'{args.run_name}.pt')
+            torch.save({**ckpt, 'best_epoch': best_epoch, 'best_median_km': best_metric},
+                       best_path + '.tmp')
+            os.replace(best_path + '.tmp', best_path)
+            logger.info(f'New best checkpoint: epoch {epoch}, median_km {cur}.')
+
+        # {run_name}_last.pt carries the full training state so a preempted job
+        # requeued onto a *-preempt partition resumes with --resume instead of
+        # restarting from epoch 0. Written via a temp file + os.replace so a
+        # preemption mid-write can't leave a truncated checkpoint.
+        full = {**ckpt, 'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(), 'global_step': global_step,
+                'history': history, 'best_epoch': best_epoch,
+                'best_median_km': best_metric, 'rng': rng.bit_generator.state}
+        last_path = os.path.join(args.out, f'{args.run_name}_last.pt')
+        torch.save(full, last_path + '.tmp')
+        os.replace(last_path + '.tmp', last_path)
+
+        hist_path = os.path.join(args.out, f'{args.run_name}_history.json')
+        with open(hist_path + '.tmp', 'w') as fh:
+            json.dump(history, fh, indent=2)
+        os.replace(hist_path + '.tmp', hist_path)
+
+    if start_epoch >= args.epochs:
+        logger.info(f'--resume checkpoint is already at epoch {start_epoch - 1}/'
+                    f'{args.epochs}; nothing to do.')
+    logger.info(f'Training complete. Best epoch {best_epoch} '
+                f'(median_km {best_metric:.3f}) -> {args.run_name}.pt; '
+                f'last epoch -> {args.run_name}_last.pt.')
+    if wandb_run is not None:
+        wandb.finish()
 
 
 if __name__ == '__main__':

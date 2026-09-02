@@ -47,3 +47,16 @@ python -m energy.refine --coarse saved_models/energy/stage_d.pt   # Stage E
 python -m energy.pigeon_lite                              # control row
 python -m energy.benchmark --coarse ... --refiner ... --benchmark im2gps3k
 ```
+
+`energy.train` writes two checkpoints per run: `{run_name}.pt` is the best
+epoch by validation median_km (this is what `--init-from` and eval should
+use), and `{run_name}_last.pt` is the final epoch, kept for inspecting
+divergence.
+
+`{run_name}_last.pt` also carries the full training state (optimizer, LR
+scheduler, epoch, step, RNG, history). Pass `--resume
+saved_models/energy/{run_name}_last.pt` to continue a run where it left
+off, skipping completed epochs — this is how a job preempted on a
+`*-preempt` partition picks back up after Slurm requeues it. A missing
+`--resume` path just starts a fresh run, so a requeued job can always pass
+the flag unconditionally.
