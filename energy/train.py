@@ -282,7 +282,7 @@ def main():
             for name, head in model.rasters.heads.items():
                 if hasattr(head, 'log_lambda'):
                     diag[f'lambda_{name}'] = float(
-                        torch.nn.functional.softplus(head.log_lambda))
+                        torch.nn.functional.softplus(head.log_lambda.detach()))
         if args.masks > 1:
             gates = model.image_tower.gates()
             diag['gate_mean'] = float(gates.mean())
