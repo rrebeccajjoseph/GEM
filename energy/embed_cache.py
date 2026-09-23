@@ -71,6 +71,11 @@ def main():
     argp.add_argument('--num-workers', type=int, default=8)
     argp.add_argument('--metadata', default=METADATA_PATH_OSV)
     argp.add_argument('--images', default=IMAGE_PATH_OSV)
+    argp.add_argument('--shard', default=None,
+                      help='i/n: embed only rows [i*N/n, (i+1)*N/n) of the metadata into the '
+                           'shared memmap, with its own progress marker — run n of these '
+                           'concurrently (one per GPU) on a multi-GPU node. All shards must '
+                           'finish before the cache is complete.')
     args = argp.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -86,13 +91,19 @@ def main():
 
     n = len(meta)
     emb_path = os.path.join(args.out, 'embeddings.f16.npy')
+    lo, hi = 0, n
     marker_path = os.path.join(args.out, 'progress.json')
+    if args.shard:
+        i, k = (int(x) for x in args.shard.split('/'))
+        lo, hi = i * n // k, (i + 1) * n // k
+        marker_path = os.path.join(args.out, f'progress_shard{i}of{k}.json')
+        logger.info(f'Shard {i}/{k}: rows [{lo}, {hi}).')
 
     embeddings = np.lib.format.open_memmap(
         emb_path, mode='r+' if os.path.exists(emb_path) else 'w+',
         dtype=np.float16, shape=(n, CLIP_EMBED_DIM))
 
-    start_row = 0
+    start_row = lo
     if os.path.exists(marker_path):
         with open(marker_path) as fh:
             start_row = json.load(fh)['rows_done']
@@ -101,7 +112,7 @@ def main():
     processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
     model = CLIPVisionModel.from_pretrained(CLIP_MODEL).to(device).eval()
 
-    paths = [os.path.join(args.images, p) for p in meta['image'].values[start_row:]]
+    paths = [os.path.join(args.images, p) for p in meta['image'].values[start_row:hi]]
     dataset = ImageDataset(paths, processor)
     loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size,
                                          num_workers=args.num_workers)

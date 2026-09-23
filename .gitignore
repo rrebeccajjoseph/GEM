@@ -3,3 +3,8 @@ __pycache__/
 data/
 saved_models/
 .DS_Store
+
+# Cluster launch scripts: carry the Delta account and home paths
+*.sbatch
+nc/*.sh
+nc/fixup_*.py
