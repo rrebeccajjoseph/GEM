@@ -321,7 +321,8 @@ def main():
         _, _, raster_table = load_grid(args.grid, want_rasters=True)
     model = EnergyModel(in_dim=1024, d=coarse_args['d'],
                         n_masks=coarse_args['masks'], raster_table=raster_table,
-                        use_season=coarse_args.get('season', False))
+                        use_season=coarse_args.get('season', False),
+                        gated=coarse_args.get('gate', False))
     model.load_state_dict(state['model'])
     model = model.to(device)  # must happen before encode_features below —
     # train_stage_c() also moves it, but only after that call already runs.

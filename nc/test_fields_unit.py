@@ -136,4 +136,28 @@ cat = build_field(RasterioSampler(os.path.join(tmp, 'cat.tif'), nodata=0,
                                   transform_value=lambda v: v - 1), 'modal', 1.0)
 assert (cat == 1).all(), 'mode resampling + transform_value should give 2 - 1 everywhere'
 print('build_field ok')
+
+# --- visibility gate ------------------------------------------------------
+gated = RasterBank(table, in_dim=16, gated=True)
+gated.load_state_dict(bank.state_dict(), strict=False)   # same heads, fresh gate
+s = slice(0, 500)
+plain, g = bank(f, s), gated(f, s)
+# a gate floors each term at log(1 - pi): at init (logit 10) the gated bank
+# equals the ungated one wherever the summed logit is well above that floor
+far = plain > -5
+assert torch.allclose(g[far], plain[far], atol=1e-2), (g - plain)[far].abs().max()  # per-term floors, summed
+assert (g >= plain - 1e-4).all()          # the gate only ever lifts a term
+# pi -> 0: every term is flat in y (all zeros)
+torch.nn.init.constant_(gated.gate.bias, -30.0)
+assert gated(f, s).abs().max() < 1e-6
+# no-data points stay exactly 0 for any pi
+torch.nn.init.normal_(gated.gate.weight)
+only_temp = RasterBank({'temp': table['temp']}, in_dim=16, gated=True)
+torch.nn.init.normal_(only_temp.gate.weight)
+out = only_temp(f)
+assert (out[:, ~only_temp.valid_temp] == 0).all()
+# gate gradients flow; ungated checkpoints still load into ungated models
+out.sum().backward()
+assert only_temp.gate.weight.grad is not None and only_temp.gate.weight.grad.abs().sum() > 0
+print('visibility gate ok')
 print('ALL OK')

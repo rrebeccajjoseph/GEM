@@ -8,6 +8,8 @@ Z is exact. Nothing couples m and s, so the (m, s) marginalization factorizes:
 F(x, y) = -logsumexp_j(-E_vis) - logsumexp_t(-E_season) + raster terms
 
 and no [B, M*T, |G|] tensor ever exists — only [B, M, |G|] and [B, T, |G|].
+With --gate each raster term also marginalizes its own visibility latent
+o_k in closed form (RasterBank.forward), which factorizes the same way.
 
 Sign convention throughout: the code works in LOGITS (= negative energies),
 so F is computed as -logsumexp(vis_logits over m) - logsumexp(season_logits
@@ -217,15 +219,28 @@ class RasterBank(nn.Module):
     CATEGORICAL_FROM_DATA = {'country', 'region', 'subregion', 'land_cover',
                              'soil', 'road_index', 'scene'}
 
-    def __init__(self, table: dict, in_dim: int=1024):
+    def __init__(self, table: dict, in_dim: int=1024, gated: bool=False,
+                 gate_init_logit: float=10.0):
         """
         Args:
             table (dict): name -> np.ndarray [G] raw raster values (NaN = no data)
             in_dim (int): image embedding dim
+            gated (bool): add a per-term visibility gate (see forward)
+            gate_init_logit (float): initial gate logit. A gate floors its
+                term at log(1 - pi) ~ -gate_init_logit, so at 10 a gated
+                model starts equal to the ungated one wherever a term's
+                logit is above ~-10 nats, and only clips harsher penalties.
         """
         super().__init__()
         self.names = sorted(table.keys())
         self.heads = nn.ModuleDict()
+        self.gate = None
+        if gated:
+            # One visibility logit per raster term, a function of the image
+            # alone: whether the clue is observable in x, not where x is.
+            self.gate = nn.Linear(in_dim, len(self.names))
+            nn.init.zeros_(self.gate.weight)
+            nn.init.constant_(self.gate.bias, gate_init_logit)
         self.kinds = {}     # name -> 'categorical' | 'drive_side' | 'gaussian'
         self.n_classes = {}
         self.stats = {}     # name -> (mean, std) of the transformed raster
@@ -319,14 +334,39 @@ class RasterBank(nn.Module):
             out[name] = self.normalize(name, fields.sample(name, latlng, mode))
         return out
 
+    def visibility(self, f: Tensor) -> Tensor:
+        """pi_k(x): probability each raster term's clue is visible [B, K],
+        columns in self.names order. All ones when ungated."""
+        if self.gate is None:
+            return torch.ones(f.shape[0], len(self.names), device=f.device)
+        return torch.sigmoid(self.gate(f))
+
     def forward(self, f: Tensor, grid_slice: slice=None, values: dict=None) -> Tensor:
         """Summed raster logits [B, N]: over (a slice of) the grid table, or
-        over explicit points when `values` (from at_points) is given."""
+        over explicit points when `values` (from at_points) is given.
+
+        Gated, each term marginalizes a binary latent o_k (is the clue
+        visible in x?) in closed form:
+
+            logit_k(x, y) = log( pi_k(x) exp(compat_k(x, y)) + (1 - pi_k(x)) )
+
+        With o_k = 0 the term is flat in y (exp(0) = 1), so an unobservable
+        clue drops out instead of voting — and where compat_k is 0 (no data
+        at y) the term is exactly 0 for any pi, as before. Like the mask and
+        season latents this only adds a [B, N] logaddexp per term; Z stays a
+        plain sum over the same points.
+        """
         if values is None:
             values = self.lookup(grid_slice)
+        if self.gate is not None:
+            g = self.gate(f)                                    # [B, K]
+            log_pi = nn.functional.logsigmoid(g).unsqueeze(-1)  # [B, K, 1]
+            log_not = nn.functional.logsigmoid(-g).unsqueeze(-1)
         total = None
-        for name in self.names:
+        for k, name in enumerate(self.names):
             term = self.heads[name](f, *values[name])
+            if self.gate is not None:
+                term = torch.logaddexp(log_pi[:, k] + term, log_not[:, k].expand_as(term))
             total = term if total is None else total + term
         return total
 
@@ -362,15 +402,17 @@ class EnergyModel(nn.Module):
         n_masks (int): M (1 for Stages A-C)
         raster_table (dict, optional): name -> [G] values; enables raster terms
         use_season (bool, optional): enables the season latent (needs climate raster)
+        gated (bool, optional): per-raster-term visibility gate (RasterBank.forward)
     """
 
     def __init__(self, in_dim: int=1024, d: int=512, n_masks: int=1,
-                 raster_table: dict=None, use_season: bool=False):
+                 raster_table: dict=None, use_season: bool=False,
+                 gated: bool=False):
         super().__init__()
         self.d = d
         self.image_tower = ImageTower(in_dim=in_dim, d=d, n_masks=n_masks)
         self.location_tower = LocationTower(d=d)
-        self.rasters = RasterBank(raster_table, in_dim) if raster_table else None
+        self.rasters = RasterBank(raster_table, in_dim, gated=gated) if raster_table else None
         self.season = None
         if use_season:
             assert raster_table is not None and 'climate' in raster_table, \
