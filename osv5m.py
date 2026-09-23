@@ -110,8 +110,18 @@ def adapt(val_size: int=10000, seed: int=330) -> None:
             df = df[df['image'].notnull()]
 
         df['selection'] = split
-        frames.append(df[['image', 'lat', 'lng', 'month', 'selection',
-                          'id', 'country', 'drive_side']])
+        # region/sub-region/land_cover/soil/road_index/dist_sea: all already
+        # in OSV-5M's own CSV, no geocoding or external raster needed —
+        # previously dropped here despite costing nothing to keep.
+        df = df.rename(columns={'sub-region': 'subregion'})  # dash isn't a
+        # valid nn.Module buffer/ModuleDict name (RasterBank keys off this).
+        # city: kept for Stage E's fine-candidate city-compatibility term
+        # (nearest-observation lookup, not a coarse grid raster — a city is
+        # usually far smaller than a res-4 cell, so it belongs at Stage E's
+        # ~0.86km candidate resolution, not RasterBank's 60km grid).
+        frames.append(df[['image', 'lat', 'lng', 'month', 'selection', 'id',
+                          'country', 'drive_side', 'region', 'subregion',
+                          'land_cover', 'soil', 'road_index', 'dist_sea', 'city']])
 
     data = pd.concat(frames, ignore_index=True)
 
