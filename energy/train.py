@@ -86,6 +86,10 @@ def main():
     argp.add_argument('--masks', type=int, default=1)
     argp.add_argument('--rasters', action='store_true', default=False)
     argp.add_argument('--season', action='store_true', default=False)
+    argp.add_argument('--gate', action='store_true', default=False,
+                      help='Visibility gate on every raster term: each clue can '
+                           'abstain (flat in y) when the image does not show it. '
+                           'Needs --rasters.')
     argp.add_argument('--contrastive', action='store_true', default=False,
                       help="Ablation 0a': InfoNCE with in-batch negatives.")
     argp.add_argument('--smooth-tau', type=float, default=None,
@@ -167,8 +171,11 @@ def main():
     logger.info(f"Rows: train {len(splits['train'])}, val {len(splits['val'])}.")
 
     # Model
+    if args.gate and not args.rasters:
+        raise SystemExit('--gate gates the raster terms; it needs --rasters.')
     model = EnergyModel(in_dim=embeddings.shape[1], d=args.d, n_masks=args.masks,
-                        raster_table=raster_table, use_season=args.season).to(device)
+                        raster_table=raster_table, use_season=args.season,
+                        gated=args.gate).to(device)
     if args.init_from and args.resume:
         raise SystemExit('--init-from and --resume are mutually exclusive.')
     if args.init_from:
@@ -340,6 +347,13 @@ def main():
         # Val metrics on a subsample
         val_rows = splits['val'][:args.eval_samples]
         val_emb = torch.from_numpy(np.asarray(embeddings[val_rows], dtype=np.float32))
+        if model.rasters is not None and model.rasters.gate is not None:
+            # Mean visibility per clue: a term stuck near 1 never abstains, one
+            # collapsed to 0 has been switched off by the model entirely.
+            with torch.no_grad():
+                vis = model.rasters.visibility(val_emb[:4096].to(device)).mean(dim=0)
+            for name, v in zip(model.rasters.names, vis.tolist()):
+                diag[f'visibility_{name}'] = v
         metrics = evaluate_on_cache(model, val_emb, train_latlng_np[val_rows],
                                     grid_rff, latlngs_np, device=device)
         model.train()

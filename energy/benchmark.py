@@ -180,7 +180,8 @@ def main():
         _, _, raster_table = load_grid(args.grid, want_rasters=True)
     coarse = EnergyModel(in_dim=1024, d=coarse_args['d'],
                          n_masks=coarse_args['masks'], raster_table=raster_table,
-                         use_season=coarse_args.get('season', False)).to(device)
+                         use_season=coarse_args.get('season', False),
+                         gated=coarse_args.get('gate', False)).to(device)
     coarse.load_state_dict(state['model'])
     coarse.eval()
 
