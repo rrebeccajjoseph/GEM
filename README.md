@@ -29,7 +29,12 @@ nodes alone the model hides unbounded mass in spikes between them
 (`nc/test_continuous_unit.py` reproduces both cases). The train loss is the
 log-density relative to uniform, so it goes negative. `--gate` adds a
 closed-form visibility latent per raster term, so a clue the image doesn't
-show stops voting.
+show stops voting. Inference is cell-free too (`energy.infer`). The coarse
+posterior over fixed nodes gives NMS-separated starts. Each start takes a
+local search at the node-spacing scale, then gradient descent on F(x, y)
+with respect to y itself. This replaces Stage E's res-8 candidate cells:
+`energy.benchmark` does it automatically for a `--continuous` checkpoint,
+and reports `coarse_*` (best node) and `refined_*`.
 
 Training data: [OSV-5M](https://huggingface.co/datasets/osv5m/osv5m)
 (Astruc et al., CVPR 2024). Encoder:

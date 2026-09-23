@@ -95,7 +95,12 @@ class RasterFields(nn.Module):
         for w, (r, c) in zip(weights, corners):
             v = field[rows[r], cols[c]]
             ok = ~torch.isnan(v)
-            num = num + torch.where(ok, w * v, torch.zeros_like(v))
-            den = den + torch.where(ok, w, torch.zeros_like(w))
+            # zero NaNs BEFORE multiplying: torch.where(ok, w * v, 0) would
+            # still backpropagate 0 * NaN = NaN into w, and through it into
+            # the coordinate being optimized (energy.infer)
+            v = torch.where(ok, v, torch.zeros_like(v))
+            w = w * ok
+            num = num + w * v
+            den = den + w
         return torch.where(den > 0, num / den.clamp(min=1e-12),
                            torch.full_like(num, float('nan')))
