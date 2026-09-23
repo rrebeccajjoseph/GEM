@@ -3,6 +3,12 @@ through the SAME encoder as training and run the full metric suite —
 coarse posterior metrics (distance thresholds + calibration) and, given a
 Stage E checkpoint, refined predictions.
 
+A --continuous coarse checkpoint is evaluated cell-free instead: the coarse
+posterior is over the fixed quadrature nodes (rasters from its fields), and
+refined_* is a local search plus gradient descent on the energy from --topk
+NMS-separated starts (energy.infer) — no H3 cells and no Stage E scorer. Compare it with a
+cell pipeline's refined_* (Stage E) on the same benchmark.
+
 Reads the repo's data/benchmarks/benchmarks.json (name -> meta CSV + image
 dir) so both pipelines evaluate on identical files. Benchmark CSVs vary in
 column naming; lat/lng and image columns are auto-detected.
@@ -94,8 +100,6 @@ def encode_benchmark(name: str, paths, embed_cache_dir: str,
     """Encodes benchmark images with the configured encoder, cached on disk
     keyed by (benchmark, encoder)."""
     from config import CLIP_MODEL, CLIP_EMBED_DIM
-    from transformers import CLIPProcessor, CLIPVisionModel
-    from energy.embed_cache import ImageDataset
 
     encoder_tag = CLIP_MODEL.replace('/', '_')
     cache_path = os.path.join(embed_cache_dir, f'{name}.{encoder_tag}.npy')
@@ -105,6 +109,10 @@ def encode_benchmark(name: str, paths, embed_cache_dir: str,
             logger.info(f'Loaded cached embeddings: {cache_path}.')
             return emb
         logger.warning(f'Cached embedding count mismatch, re-encoding {name}.')
+
+    # imported only on a cache miss: a cached benchmark needs no transformers
+    from transformers import CLIPProcessor, CLIPVisionModel
+    from energy.embed_cache import ImageDataset
 
     processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
     model = CLIPVisionModel.from_pretrained(CLIP_MODEL).to(device).eval()
@@ -166,7 +174,20 @@ def main():
                       help='Name from data/benchmarks/benchmarks.json.')
     argp.add_argument('--grid', default='data/energy/grid.npz')
     argp.add_argument('--embed-cache', default='data/energy/benchmark_cache')
-    argp.add_argument('--topk', type=int, default=20)
+    argp.add_argument('--topk', type=int, default=None,
+                      help='Stage E candidate cells (default 20), or gradient-descent '
+                           'starts for a --continuous checkpoint (default 8).')
+    argp.add_argument('--fields', default=None,
+                      help='Raster fields for a --continuous checkpoint (default: the '
+                           'path it trained with).')
+    argp.add_argument('--refine-steps', type=int, default=100,
+                      help='Gradient-descent steps per start for a --continuous checkpoint.')
+    argp.add_argument('--search-samples', type=int, default=256,
+                      help='Local-search samples per start before descent for a '
+                           '--continuous checkpoint (0 = descent only).')
+    argp.add_argument('--tag', default=None,
+                      help='Suffix for the output json, so runs of different '
+                           'checkpoints on one benchmark do not overwrite each other.')
     argp.add_argument('--out', default='saved_models/energy')
     args = argp.parse_args()
 
@@ -178,7 +199,8 @@ def main():
     raster_table = None
     if coarse_args.get('rasters'):
         _, _, raster_table = load_grid(args.grid, want_rasters=True)
-    coarse = EnergyModel(in_dim=1024, d=coarse_args['d'],
+    in_dim = state['model']['image_tower.net.0.weight'].shape[1]  # the encoder's width
+    coarse = EnergyModel(in_dim=in_dim, d=coarse_args['d'],
                          n_masks=coarse_args['masks'], raster_table=raster_table,
                          use_season=coarse_args.get('season', False),
                          gated=coarse_args.get('gate', False)).to(device)
@@ -205,14 +227,33 @@ def main():
     embeddings = encode_benchmark(args.benchmark, paths, args.embed_cache,
                                   device=device)
 
-    metrics = evaluate_benchmark(coarse, embeddings, bench_latlngs, grid_rff,
-                                 latlngs_np, refiner=refiner, bank=bank,
-                                 topk=args.topk, device=device)
+    if coarse_args.get('continuous'):
+        from energy.fields import RasterFields
+        from energy.quadrature import SphereQuadrature
+        from energy.infer import evaluate_continuous
+        if refiner is not None:
+            raise SystemExit('--refiner is a Stage E (cell) scorer; a --continuous '
+                             'checkpoint refines by gradient descent instead.')
+        nodes = SphereQuadrature(coarse_args.get('quad_points') or len(latlngs_np),
+                                 device=device).fixed()
+        fields = None
+        if coarse_args.get('rasters'):
+            fields = RasterFields.load(args.fields or coarse_args['fields']).to(device)
+        metrics = evaluate_continuous(
+            coarse, torch.from_numpy(np.asarray(embeddings, dtype=np.float32)),
+            bench_latlngs, coarse.location_tower.encode_features(nodes), nodes,
+            fields=fields, k=args.topk or 8, steps=args.refine_steps,
+            search_samples=args.search_samples, device=device)
+    else:
+        metrics = evaluate_benchmark(coarse, embeddings, bench_latlngs, grid_rff,
+                                     latlngs_np, refiner=refiner, bank=bank,
+                                     topk=args.topk or 20, device=device)
     metrics = {k: v for k, v in metrics.items() if not isinstance(v, list)}
     logger.info(json.dumps(metrics, indent=2))
 
     os.makedirs(args.out, exist_ok=True)
-    out_path = os.path.join(args.out, f'benchmark_{args.benchmark}.json')
+    suffix = f'_{args.tag}' if args.tag else ''
+    out_path = os.path.join(args.out, f'benchmark_{args.benchmark}{suffix}.json')
     with open(out_path, 'w') as fh:
         json.dump(metrics, fh, indent=2)
     logger.info(f'Saved to {out_path}.')

@@ -176,4 +176,31 @@ r = subprocess.run(base + ['--epochs', '4', '--resume', os.path.join(out, 'smoke
 assert r.returncode == 0, r.stderr[-3000:]
 assert len(json.load(open(os.path.join(out, 'smoke_history.json')))) == 4
 print('energy.train --continuous ok')
+
+# --- energy.benchmark on the continuous checkpoint -----------------------
+# Pre-cached benchmark embeddings, so no images or transformers are touched.
+sys.path.insert(0, os.getcwd())
+from config import CLIP_MODEL
+bench = os.path.join(tmp, 'bench'); os.makedirs(os.path.join(bench, 'data', 'benchmarks'))
+nb = 40
+cb = rng.integers(0, 4, nb)
+pd.DataFrame({'lat': centers.numpy()[cb, 0], 'lng': centers.numpy()[cb, 1],
+              'image': [f'{i}.jpg' for i in range(nb)]}) \
+    .to_csv(os.path.join(bench, 'toy.csv'), index=False)
+json.dump({'toy': {'meta': os.path.join(bench, 'toy.csv'), 'images': bench}},
+          open(os.path.join(bench, 'data', 'benchmarks', 'benchmarks.json'), 'w'))
+ecache = os.path.join(bench, 'ecache'); os.makedirs(ecache)
+np.save(os.path.join(ecache, f"toy.{CLIP_MODEL.replace('/', '_')}.npy"),
+        (emb.numpy()[cb] + rng.normal(0, 0.1, (nb, 16))).astype(np.float32))
+r = subprocess.run([sys.executable, '-m', 'energy.benchmark', '--coarse', os.path.join(out, 'smoke.pt'),
+                    '--benchmark', 'toy', '--grid', os.path.join(tmp, 'grid.npz'),
+                    '--embed-cache', ecache, '--out', bench, '--tag', 'cont', '--refine-steps', '30',
+                    '--search-samples', '64'],
+                   cwd=bench, capture_output=True, text=True,
+                   env={**os.environ, 'PYTHONPATH': os.getcwd()})
+assert r.returncode == 0, r.stderr[-3000:]
+res_b = json.load(open(os.path.join(bench, 'benchmark_toy_cont.json')))
+print('  benchmark:', {k: round(v, 1) for k, v in res_b.items() if k.endswith('median_km')})
+assert res_b['refined_median_km'] <= res_b['coarse_median_km'] + 1e-6
+print('energy.benchmark --continuous ok')
 print('ALL OK')
