@@ -21,8 +21,11 @@ def haversine_km(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 @torch.no_grad()
-def predict(model, f: Tensor, grid_rff: Tensor, chunk_size: int=65536):
-    """Full posterior over the grid.
+def predict(model, f: Tensor, grid_rff: Tensor, chunk_size: int=65536,
+            grid_latlng: Tensor=None, fields=None):
+    """Full posterior over the grid — H3 centroids with the raster table, or,
+    given fields, any point set (quadrature nodes) with rasters sampled at
+    the points (grid_latlng [G, 2] required then).
 
     Returns:
         tuple: (log_p [B, G] torch, pred_idx [B] np.ndarray)
@@ -30,8 +33,13 @@ def predict(model, f: Tensor, grid_rff: Tensor, chunk_size: int=65536):
     neg_f = []
     for start in range(0, grid_rff.shape[0], chunk_size):
         loc_emb = model.location_tower.forward_features(grid_rff[start:start + chunk_size])
+        raster_values = None
+        if fields is not None and model.rasters is not None:
+            raster_values = model.rasters.at_points(
+                fields, grid_latlng[start:start + loc_emb.shape[0]])
         neg_f.append(model.neg_free_energy(
-            f, loc_emb, grid_slice=slice(start, start + loc_emb.shape[0])))
+            f, loc_emb, grid_slice=slice(start, start + loc_emb.shape[0]),
+            raster_values=raster_values))
     neg_f = torch.cat(neg_f, dim=1)                          # [B, G]
     log_p = neg_f - torch.logsumexp(neg_f, dim=1, keepdim=True)
     return log_p, log_p.argmax(dim=1).cpu().numpy()
@@ -72,13 +80,18 @@ def calibration_metrics(entropy: np.ndarray, pred_latlng: np.ndarray,
 
 def evaluate_on_cache(model, embeddings: Tensor, latlngs: np.ndarray,
                       grid_rff: Tensor, grid_latlngs: np.ndarray,
-                      batch_size: int=256, device: str='cpu') -> dict:
-    """Runs the full metric suite over a cached-embedding split."""
+                      batch_size: int=256, device: str='cpu', fields=None) -> dict:
+    """Runs the full metric suite over a cached-embedding split. With fields,
+    grid_rff/grid_latlngs may be any point set (see predict)."""
     model.eval()
+    grid_latlng_t = None
+    if fields is not None:
+        grid_latlng_t = torch.as_tensor(grid_latlngs, dtype=torch.float32, device=device)
     all_entropy, all_pred = [], []
     for start in range(0, len(embeddings), batch_size):
         f = embeddings[start:start + batch_size].to(device)
-        log_p, pred_idx = predict(model, f, grid_rff)
+        log_p, pred_idx = predict(model, f, grid_rff, grid_latlng=grid_latlng_t,
+                                  fields=fields)
         # Reduce to per-row entropy here — keeping every batch's full
         # [B, |G|] log_p and concatenating OOMs on big benchmarks (YFCC26k
         # is 21.5k rows x 288k cells ~= 25 GB per copy).

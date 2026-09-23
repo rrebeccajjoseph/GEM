@@ -6,6 +6,13 @@ Stages map to flags (each stage changes one thing):
     D  --masks 16 --season  + latent masks and the season latent
     0a' --contrastive     same towers, InfoNCE instead of exact NLL
 
+--continuous replaces the H3 grid everywhere in training: targets are the
+true coordinates (not snapped centroids), Z is importance-sampled each step
+over randomly rotated uniform nodes plus local nodes around the batch's
+targets (energy.quadrature), raster terms are sampled from lat/lng fields,
+and validation scores a fixed node set. Its train loss is the log-density
+relative to uniform, so it goes negative — compare runs by median_km.
+
 Stage C (encoder unfreezing) is not served by this trainer — it needs image
 gradients, not cached embeddings.
 
@@ -32,7 +39,10 @@ import pandas as pd
 import torch
 
 from energy.model import EnergyModel
-from energy.losses import exact_nll, smoothed_nll, routing_regularizers, info_nce
+from energy.losses import (exact_nll, continuous_nll, smoothed_nll,
+                           routing_regularizers, info_nce)
+from energy.fields import RasterFields
+from energy.quadrature import SphereQuadrature
 from energy.evaluation import evaluate_on_cache
 from energy.grid import build_grid, cell_index_map, snap_to_grid
 
@@ -90,6 +100,20 @@ def main():
                       help='Visibility gate on every raster term: each clue can '
                            'abstain (flat in y) when the image does not show it. '
                            'Needs --rasters.')
+    argp.add_argument('--continuous', action='store_true', default=False,
+                      help='Cell-free training: exact-coordinate targets, Z over '
+                           'randomly rotated quadrature nodes, rasters from --fields.')
+    argp.add_argument('--fields', default='data/energy/fields.npz',
+                      help='Lat/lng raster fields (energy.grid --fields-out); used '
+                           'with --continuous --rasters.')
+    argp.add_argument('--quad-points', type=int, default=None,
+                      help='Uniform quadrature nodes per step with --continuous '
+                           '(default: the grid size, for matched compute).')
+    argp.add_argument('--local-scales-km', default='2,20,200',
+                      help='With --continuous: scales of the vMF importance kernels '
+                           'sampled around every batch target (energy.quadrature).')
+    argp.add_argument('--local-per-target', type=int, default=4,
+                      help='With --continuous: local samples per target per scale.')
     argp.add_argument('--contrastive', action='store_true', default=False,
                       help="Ablation 0a': InfoNCE with in-batch negatives.")
     argp.add_argument('--smooth-tau', type=float, default=None,
@@ -158,13 +182,20 @@ def main():
     G = grid_latlngs.shape[0]
     logger.info(f'Grid: {G} cells at H3 res {resolution}.')
 
+    if args.continuous and (args.contrastive or args.smooth_tau is not None):
+        raise SystemExit('--continuous replaces the exact grid NLL; it does not '
+                         'combine with --contrastive or --smooth-tau.')
+
     # Data
     embeddings, index = load_cache(args.cache)
-    cells, _ = build_grid(resolution)
-    idx_map = cell_index_map(cells)
-    logger.info('Snapping targets to grid cells.')
-    index['cell_idx'] = snap_to_grid(index['lat'].values, index['lng'].values,
-                                     resolution, idx_map)
+    if args.continuous:
+        index['cell_idx'] = -1  # never read: targets stay exact coordinates
+    else:
+        cells, _ = build_grid(resolution)
+        idx_map = cell_index_map(cells)
+        logger.info('Snapping targets to grid cells.')
+        index['cell_idx'] = snap_to_grid(index['lat'].values, index['lng'].values,
+                                         resolution, idx_map)
 
     splits = {name: np.flatnonzero((index['selection'] == name).values)
               for name in ['train', 'val']}
@@ -199,6 +230,23 @@ def main():
     # Fixed RFF encoding of the grid — precomputed once (centroids never move);
     # the location-tower MLP on top still runs in-graph every step.
     grid_rff = model.location_tower.encode_features(grid_latlngs)
+
+    # Cell-free: validation scores a fixed node set with rasters from fields;
+    # training draws a fresh rotation of the same nodes every step.
+    quad, fields = None, None
+    eval_rff, eval_latlngs_np = grid_rff, latlngs_np
+    if args.continuous:
+        quad = SphereQuadrature(args.quad_points or G, device=device,
+                                local_scales_km=tuple(float(x) for x in
+                                                      args.local_scales_km.split(',')),
+                                local_per_target=args.local_per_target)
+        eval_nodes = quad.fixed()
+        eval_rff = model.location_tower.encode_features(eval_nodes)
+        eval_latlngs_np = eval_nodes.cpu().numpy()
+        logger.info(f'Continuous: {quad.n} quadrature nodes per step.')
+        if args.rasters:
+            fields = RasterFields.load(args.fields).to(device)
+            logger.info(f'Raster fields from {args.fields}: {fields.names}.')
 
     tower_params, head_params = [], []
     for name, p in model.named_parameters():
@@ -260,6 +308,7 @@ def main():
             y_latlng = torch.from_numpy(train_latlng_np[rows]).to(device)
             y_idx = torch.from_numpy(train_cells_np[rows]).to(device)
 
+            ess = None
             if args.contrastive:
                 loss = info_nce(model, f, y_latlng)
             elif args.smooth_tau is not None:
@@ -268,14 +317,22 @@ def main():
                                     chunk_size=args.chunk_size,
                                     checkpoint_chunks=args.checkpoint_chunks).mean()
             else:
-                nll, _, _ = exact_nll(model, f, y_idx, grid_rff,
-                                      chunk_size=args.chunk_size,
-                                      checkpoint_chunks=args.checkpoint_chunks)
+                if args.continuous:
+                    nodes, log_q = quad.sample(rng, y_latlng)
+                    nll, _, _, ess = continuous_nll(
+                        model, f, y_latlng, nodes, node_log_q=log_q, fields=fields,
+                        chunk_size=args.chunk_size,
+                        checkpoint_chunks=args.checkpoint_chunks)
+                else:
+                    nll, _, _ = exact_nll(model, f, y_idx, grid_rff,
+                                          chunk_size=args.chunk_size,
+                                          checkpoint_chunks=args.checkpoint_chunks)
                 loss = nll.mean()
 
                 if args.masks > 1:
                     warm = min(1.0, global_step / max(args.warmup_steps, 1))
-                    loc_emb_t = model.location_tower.forward_features(grid_rff[y_idx])
+                    loc_emb_t = (model.location_tower(y_latlng) if args.continuous else
+                                 model.location_tower.forward_features(grid_rff[y_idx]))
                     r = model.routing_posterior(f, loc_emb_t)
                     regs = routing_regularizers(r, model.image_tower.gates())
                     loss = loss + warm * args.mu_conf * regs['confidence'] \
@@ -319,10 +376,16 @@ def main():
             global_step += 1
 
             if wandb_run is not None and global_step % args.wandb_log_every == 0:
-                wandb.log({'train/loss_step': loss.item(),
-                           'train/grad_norm': float(grad_norm),
-                           'train/lr': scheduler.get_last_lr()[0],
-                           'epoch': epoch}, step=global_step)
+                step_log = {'train/loss_step': loss.item(),
+                            'train/grad_norm': float(grad_norm),
+                            'train/lr': scheduler.get_last_lr()[0],
+                            'epoch': epoch}
+                if ess is not None:
+                    # Spikiness tripwire: node weights carried by few nodes
+                    # means log Ẑ is dominated by luck, not the field.
+                    step_log['train/ess_p10'] = float(ess.quantile(0.1))
+                    step_log['train/ess_median'] = float(ess.median())
+                wandb.log(step_log, step=global_step)
 
         train_loss = epoch_loss / epoch_n
 
@@ -340,7 +403,7 @@ def main():
         # Tripwire for the negative-phase bug (norms inflating on popular cells)
         with torch.no_grad():
             h_norms = model.location_tower.forward_features(
-                grid_rff[::max(1, G // 4096)]).norm(dim=-1)
+                eval_rff[::max(1, eval_rff.shape[0] // 4096)]).norm(dim=-1)
             diag['h_norm_p50'] = float(h_norms.median())
             diag['h_norm_p99'] = float(h_norms.quantile(0.99))
 
@@ -355,7 +418,8 @@ def main():
             for name, v in zip(model.rasters.names, vis.tolist()):
                 diag[f'visibility_{name}'] = v
         metrics = evaluate_on_cache(model, val_emb, train_latlng_np[val_rows],
-                                    grid_rff, latlngs_np, device=device)
+                                    eval_rff, eval_latlngs_np, device=device,
+                                    fields=fields)
         model.train()
 
         record = {'epoch': epoch, 'train_loss': train_loss, **diag,

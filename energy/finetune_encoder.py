@@ -9,6 +9,10 @@ layer(s)" so the comparison stays fair).
 The full-grid location forward is negligible next to the ViT-L forward at
 this stage — no chunking heroics needed beyond the usual streaming logsumexp.
 
+A --continuous coarse checkpoint trains cell-free here too (exact-coordinate
+targets, rotated quadrature nodes, rasters from --fields); the mode is read
+from the checkpoint, not re-chosen.
+
 After training, REBUILD the embedding cache with --encoder-out before
 running Stage D / E on top: the cached embeddings are stale the moment the
 encoder moves.
@@ -37,7 +41,9 @@ import torch
 from torch import nn
 
 from energy.model import EnergyModel
-from energy.losses import exact_nll
+from energy.losses import exact_nll, continuous_nll
+from energy.fields import RasterFields
+from energy.quadrature import SphereQuadrature
 from energy.grid import build_grid, cell_index_map, snap_to_grid
 
 logger = logging.getLogger('energy.finetune_encoder')
@@ -106,14 +112,18 @@ def train_stage_c(encoder: nn.Module, model: EnergyModel, loader,
                   epochs: int=5, tower_lr: float=1e-4,
                   chunk_size: int=32768, device: str='cpu',
                   log_every: int=100, on_epoch_end=None, wandb_run=None,
-                  resume_state: dict=None, ckpt_every: int=2000, on_ckpt=None):
+                  resume_state: dict=None, ckpt_every: int=2000, on_ckpt=None,
+                  loss_fn=None):
     """The Stage C loop, generic over the encoder (testable with a stub).
 
     Args:
         encoder: module mapping pixel batches -> [B, in_dim] embeddings
         model: EnergyModel with towers initialized from Stage A/B
-        loader: yields (pixels, cell_idx) batches
+        loader: yields (pixels, target) batches — grid cell indices for the
+            default exact grid NLL, whatever loss_fn expects otherwise
         grid_rff: fixed grid RFF features [G, F]
+        loss_fn (callable, optional): (model, f, target) -> nll [B]; defaults
+            to exact_nll over grid_rff
         encoder_groups: param groups from encoder_param_groups
         on_epoch_end (callable, optional): callback(epoch, mean_loss, optimizer,
             global_step) — full-epoch summary.
@@ -150,11 +160,14 @@ def train_stage_c(encoder: nn.Module, model: EnergyModel, loader,
         encoder.train()
         model.train()
         total, n = 0.0, 0
-        for step, (pixels, y_idx) in enumerate(loader):
-            pixels, y_idx = pixels.to(device), y_idx.to(device)
+        for step, (pixels, target) in enumerate(loader):
+            pixels, target = pixels.to(device), target.to(device)
             f = encoder(pixels)
-            nll, _, _ = exact_nll(model, f, y_idx, grid_rff,
-                                  chunk_size=chunk_size)
+            if loss_fn is None:
+                nll, _, _ = exact_nll(model, f, target, grid_rff,
+                                      chunk_size=chunk_size)
+            else:
+                nll = loss_fn(model, f, target)
             loss = nll.mean()
 
             optimizer.zero_grad(set_to_none=True)
@@ -163,8 +176,8 @@ def train_stage_c(encoder: nn.Module, model: EnergyModel, loader,
                 [p for g in optimizer.param_groups for p in g['params']], 1.0)
             optimizer.step()
 
-            total += loss.item() * len(y_idx)
-            n += len(y_idx)
+            total += loss.item() * len(target)
+            n += len(target)
             global_step += 1
             if step % log_every == 0:
                 logger.info(f'epoch {epoch} step {step}: nll {loss.item():.3f}')
@@ -187,9 +200,11 @@ def train_stage_c(encoder: nn.Module, model: EnergyModel, loader,
 
 
 class TrainImageDataset(torch.utils.data.Dataset):
-    def __init__(self, paths, cell_idx, processor):
+    """(pixels, target) pairs; target is a grid cell index or a [2] lat/lng."""
+
+    def __init__(self, paths, targets, processor):
         self.paths = paths
-        self.cell_idx = cell_idx
+        self.targets = targets
         self.processor = processor
 
     def __len__(self):
@@ -216,7 +231,7 @@ class TrainImageDataset(torch.utils.data.Dataset):
             j = np.random.randint(len(self.paths))
             return self.__getitem__(j)
         pixels = self.processor(images=image, return_tensors='pt')['pixel_values']
-        return pixels.squeeze(0), self.cell_idx[i]
+        return pixels.squeeze(0), self.targets[i]
 
 
 def main():
@@ -240,6 +255,9 @@ def main():
                       help='Layer-wise lr decay (0.8 if unstable).')
     argp.add_argument('--tower-lr', type=float, default=1e-4)
     argp.add_argument('--epochs', type=int, default=5)
+    argp.add_argument('--fields', default=None,
+                      help='Raster fields for a --continuous coarse checkpoint with '
+                           'rasters (default: the path that checkpoint trained with).')
     argp.add_argument('--batch-size', type=int, default=64)
     argp.add_argument('--num-workers', type=int, default=8)
     argp.add_argument('--max-rows', type=int, default=None,
@@ -344,14 +362,35 @@ def main():
         meta = meta.sample(n=args.max_rows, random_state=330)
         logger.info(f'Subsampled training set to {len(meta)} rows '
                     f'(--max-rows {args.max_rows}).')
-    cells, _ = build_grid(resolution)
-    cell_idx = snap_to_grid(meta['lat'].values, meta['lng'].values,
-                            resolution, cell_index_map(cells))
     paths = [os.path.join(args.images, p) for p in meta['image'].values]
+
+    loss_fn = None
+    if coarse_args.get('continuous'):
+        targets = meta[['lat', 'lng']].values.astype(np.float32)
+        quad = SphereQuadrature(
+            coarse_args.get('quad_points') or len(latlngs_np), device=device,
+            local_scales_km=tuple(float(x) for x in
+                                  coarse_args.get('local_scales_km', '2,20,200').split(',')),
+            local_per_target=coarse_args.get('local_per_target', 4))
+        fields = None
+        if coarse_args.get('rasters'):
+            args.fields = args.fields or coarse_args['fields']  # saved with the ckpt
+            fields = RasterFields.load(args.fields).to(device)
+        quad_rng = np.random.default_rng(330)
+        logger.info(f'Continuous Stage C: {quad.n} rotated + local quadrature nodes per step.')
+
+        def loss_fn(model, f, target):
+            nodes, log_q = quad.sample(quad_rng, target)
+            return continuous_nll(model, f, target, nodes, node_log_q=log_q,
+                                  fields=fields)[0]
+    else:
+        cells, _ = build_grid(resolution)
+        targets = snap_to_grid(meta['lat'].values, meta['lng'].values,
+                               resolution, cell_index_map(cells))
 
     processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
     loader = torch.utils.data.DataLoader(
-        TrainImageDataset(paths, cell_idx, processor),
+        TrainImageDataset(paths, targets, processor),
         batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
         drop_last=True)
 
@@ -417,7 +456,7 @@ def main():
                   epochs=args.epochs, tower_lr=args.tower_lr, device=device,
                   on_epoch_end=save, wandb_run=wandb_run,
                   resume_state=resume_state, ckpt_every=args.ckpt_every,
-                  on_ckpt=save_ckpt)
+                  on_ckpt=save_ckpt, loss_fn=loss_fn)
     logger.info('Stage C complete. Rebuild the embedding cache with this '
                 'encoder before Stage D/E.')
 

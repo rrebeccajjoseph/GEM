@@ -1,6 +1,7 @@
-"""Exact NLL over the grid with a streaming logsumexp, routing regularizers,
-and the InfoNCE baseline objective (ablation row 0a': same towers, GeoCLIP-
-style contrastive loss, same data).
+"""Exact NLL over the grid with a streaming logsumexp, its cell-free
+counterpart over randomized quadrature nodes (continuous_nll), routing
+regularizers, and the InfoNCE baseline objective (ablation row 0a': same
+towers, GeoCLIP-style contrastive loss, same data).
 
 The grid axis is processed in chunks. IMPORTANT: chunking alone does not
 reduce autograd peak memory (every chunk's activations stay in the graph);
@@ -79,6 +80,87 @@ def exact_nll(model, f: Tensor, target_idx: Tensor, grid_rff: Tensor,
 
     nll = log_z - neg_f_t
     return nll, neg_f_t, log_z
+
+
+def continuous_nll(model, f: Tensor, target_latlng: Tensor, node_latlng: Tensor,
+                   node_log_q: Tensor=None, fields=None, chunk_size: int=32768,
+                   checkpoint_chunks: bool=False):
+    """Cell-free NLL: the energy is scored at the TRUE coordinate, and Z is
+    an importance-sampled integral over quadrature nodes
+    (energy.quadrature.SphereQuadrature.sample) instead of a sum over fixed
+    H3 centroids:
+
+        log Ẑ = logsumexp_i( -F(x, y_i) - log q(y_i) ) - log N
+        nll   = log Ẑ + F(x, y*) - log 4π
+
+    i.e. the negative log-density at y* relative to the uniform density on
+    the sphere (0 = no better than uniform, negative = better). Scoring the
+    exact point is safe here only because the proposal q always samples the
+    neighbourhood of every target — see energy.quadrature for why a uniform
+    node set alone lets the model hide unbounded mass in spikes.
+
+    Raster terms are sampled at every node and at y* from `fields`
+    (RasterBank.at_points), never looked up per cell.
+
+    Args:
+        model (EnergyModel): the model
+        f (Tensor): image embeddings [B, in_dim]
+        target_latlng (Tensor): true coordinates [B, 2], not snapped
+        node_latlng (Tensor): quadrature nodes [N, 2]
+        node_log_q (Tensor, optional): proposal log-density per steradian of
+            each node [N]; None = uniform nodes (log q = -log 4π)
+        fields (RasterFields, optional): required iff the model has rasters
+        chunk_size (int, optional): nodes per chunk
+        checkpoint_chunks (bool, optional): gradient-checkpoint each chunk
+
+    Returns:
+        tuple: (nll [B], neg_f_target [B], log_z [B], ess [B]) — ess is the
+            effective sample size 1 / Σ w_i² of the normalized importance
+            weights (detached); it collapsing toward 1 means Z is carried by
+            a single node, i.e. the field is sharper than the proposal.
+    """
+    if model.rasters is not None and fields is None:
+        raise ValueError('A model with raster terms needs fields for continuous_nll '
+                         '(python -m energy.grid --fields-out).')
+    N = node_latlng.shape[0]
+    if node_log_q is None:
+        node_log_q = torch.full((N,), -math.log(4 * math.pi), device=node_latlng.device)
+
+    def raster_values(latlng: Tensor):
+        return None if model.rasters is None else model.rasters.at_points(fields, latlng)
+
+    def chunk_lse(latlng_chunk: Tensor, log_q_chunk: Tensor):
+        loc_emb = model.location_tower.forward_features(
+            model.location_tower.encode_features(latlng_chunk))           # [Nc, d]
+        neg_f = model.neg_free_energy(f, loc_emb, raster_values=raster_values(latlng_chunk))
+        log_w = neg_f - log_q_chunk.unsqueeze(0)                           # [B, Nc]
+        return torch.logsumexp(log_w, dim=1), torch.logsumexp(2 * log_w.detach(), dim=1)
+
+    lses, lses2 = [], []
+    for start in range(0, N, chunk_size):
+        chunk = node_latlng[start:start + chunk_size]
+        log_q_chunk = node_log_q[start:start + chunk_size]
+        if checkpoint_chunks and torch.is_grad_enabled():
+            lse, lse2 = checkpoint(chunk_lse, chunk, log_q_chunk, use_reentrant=False)
+        else:
+            lse, lse2 = chunk_lse(chunk, log_q_chunk)
+        lses.append(lse)
+        lses2.append(lse2)
+    log_sum_w = torch.logsumexp(torch.stack(lses, dim=0), dim=0)           # [B]
+    log_z = log_sum_w - math.log(N)
+
+    # -F at each image's own true coordinate: the [B, B] map over the batch's
+    # targets, diagonal (B is small next to N, so this is cheap)
+    loc_emb_t = model.location_tower(target_latlng)                        # [B, d]
+    neg_f_t = model.neg_free_energy(
+        f, loc_emb_t, raster_values=raster_values(target_latlng)).diagonal()  # [B]
+
+    nll = log_z - neg_f_t - math.log(4 * math.pi)
+
+    with torch.no_grad():
+        log_sum_w2 = torch.logsumexp(torch.stack(lses2, dim=0), dim=0)
+        ess = torch.exp(2 * log_sum_w - log_sum_w2)
+    return nll, neg_f_t, log_z, ess
 
 
 def haversine_km_torch(a: Tensor, b: Tensor) -> Tensor:
