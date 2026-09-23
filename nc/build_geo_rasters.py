@@ -1,4 +1,11 @@
-"""Adds every energy term collected but sitting unused in OSV-5M's and
+"""SUPERSEDED by `python -m energy.maps`, which builds country / region /
+drive_side / coast_km (and optional land_cover / soil) from real maps as
+lat/lng fields. The rasters below are per-cell votes of the TRAINING
+LABELS: a prior learned from the targets, defined only on H3 cells, and for
+scene / prob_* / road_index a property of the photos rather than the place.
+Kept so existing grid_geo.npz runs stay reproducible.
+
+Adds every energy term collected but sitting unused in OSV-5M's and
 MP-16-Pro's own metadata — no geocoding, no external raster. Writes a NEW
 grid file rather than overwriting data/energy/grid.npz in place — the
 in-flight mp16_full pipeline's later Stage D step still reads the original,

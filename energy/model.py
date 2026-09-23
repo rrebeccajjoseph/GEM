@@ -202,13 +202,13 @@ class RasterBank(nn.Module):
     thing to the heads — build the model from the same --grid it trained on.
     """
 
-    LOG1P = {'precip', 'popdens'}
+    LOG1P = {'precip', 'popdens', 'coast_km'}
     HEAVY = {'popdens'}
     # Fixed-cardinality categorical rasters (Köppen's 30 classes are a stable
-    # external standard, hence the one hardcoded count) vs data-derived ones
-    # (country/region: whatever aggregate_labels_over_cells's pd.factorize
-    # found — no external standard to hardcode against, and the count varies
-    # with which datasets were pooled to build the raster).
+    # external standard, hence the one hardcoded count) vs variable ones:
+    # map rasters (energy.maps: country/region/land_cover/soil) carry their
+    # label count in the grid file; the older label-derived ones
+    # (nc/build_geo_rasters.py) are sized by the largest code in the table.
     CATEGORICAL_FIXED = {'climate': 30}
     # subregion/road_index: dash/underscore-normalized and near-discrete
     # (road_index is stored as float but only ~8 distinct values in the raw
@@ -223,7 +223,9 @@ class RasterBank(nn.Module):
                  gate_init_logit: float=10.0):
         """
         Args:
-            table (dict): name -> np.ndarray [G] raw raster values (NaN = no data)
+            table (dict): name -> np.ndarray [G] raw raster values (NaN = no
+                data), or (values, n_classes) for a categorical raster whose
+                full label count is known (energy.train.load_grid)
             in_dim (int): image embedding dim
             gated (bool): add a per-term visibility gate (see forward)
             gate_init_logit (float): initial gate logit. A gate floors its
@@ -246,12 +248,15 @@ class RasterBank(nn.Module):
         self.stats = {}     # name -> (mean, std) of the transformed raster
 
         for name in self.names:
-            raw = np.asarray(table[name], dtype=np.float64).copy()
+            entry = table[name]
+            values_np, known_classes = entry if isinstance(entry, tuple) else (entry, None)
+            raw = np.asarray(values_np, dtype=np.float64).copy()
             valid = ~np.isnan(raw)
 
             if name in self.CATEGORICAL_FIXED or name in self.CATEGORICAL_FROM_DATA:
                 self.kinds[name] = 'categorical'
-                self.n_classes[name] = self.CATEGORICAL_FIXED.get(name) or int(raw[valid].max()) + 1
+                self.n_classes[name] = (self.CATEGORICAL_FIXED.get(name) or known_classes
+                                        or int(raw[valid].max()) + 1)
                 # ClimateHead is a generic categorical compatibility head —
                 # softmax over whatever classes it's given — reused as-is for
                 # country/region rather than duplicating it.
@@ -267,7 +272,7 @@ class RasterBank(nn.Module):
                 self.heads[name] = GaussianHead(in_dim, heavy_tailed=name in self.HEAVY)
 
             values, valid_t = self.normalize(name, torch.from_numpy(
-                np.asarray(table[name], dtype=np.float64)))
+                np.asarray(values_np, dtype=np.float64)))
             self.register_buffer(f'values_{name}', values)
             self.register_buffer(f'valid_{name}', valid_t)
 
