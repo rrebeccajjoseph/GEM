@@ -60,3 +60,15 @@ off, skipping completed epochs — this is how a job preempted on a
 `*-preempt` partition picks back up after Slurm requeues it. A missing
 `--resume` path just starts a fresh run, so a requeued job can always pass
 the flag unconditionally.
+
+`energy.refine` (Stage E) follows the same convention: `{run_name}.pt` is the
+best epoch by val median_km on a 2k-row val subset (what `energy.benchmark
+--refiner` should load), `{run_name}_last.pt` carries the full state and is
+also rewritten every `--ckpt-every` steps (default 5000), so `--resume`
+continues mid-epoch. Its mined top-K (`topk{K}_{hash}.npz`) is keyed by the
+coarse checkpoint and shared across runs, and the dense H3 child table
+(`data/energy/children_r4_to_r8_*.npy`, ~11 GB, built once with
+multiprocessing) is shared by every Stage E run and by the benchmark path.
+W&B gets a step-level curve (`train/loss_step`, `train/acc_sampled`) plus
+per-epoch val metrics under `epoch/`, with the frozen coarse baseline on the
+same rows under `coarse/` in the run summary.

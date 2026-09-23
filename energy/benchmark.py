@@ -190,10 +190,15 @@ def main():
     refiner, bank = None, None
     if args.refiner:
         rstate = torch.load(args.refiner, map_location=device)
-        refiner = JointMLPScorer(in_dim=1024)
+        refiner = JointMLPScorer(in_dim=1024, hidden=rstate['args'].get('hidden', 256),
+                                 n_cities=rstate['args'].get('n_cities', 0))
         refiner.load_state_dict(rstate['scorer'])
         cells, _ = build_grid(resolution)
-        bank = CandidateBank(cells, resolution, rstate['args']['fine_res'])
+        # Same gazetteer the refiner trained with, if any — candidates need
+        # the identical city-code table the scorer's embedding was fit
+        # against; a different gazetteer's codes wouldn't line up at all.
+        bank = CandidateBank(cells, resolution, rstate['args']['fine_res'],
+                             city_gazetteer=rstate['args'].get('city_gazetteer'))
 
     paths, bench_latlngs = load_benchmark(args.benchmark)
     embeddings = encode_benchmark(args.benchmark, paths, args.embed_cache,
