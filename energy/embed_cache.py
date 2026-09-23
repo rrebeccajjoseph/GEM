@@ -78,7 +78,8 @@ def main():
     keep = ['id', 'lat', 'lng', 'month', 'selection']
     aux = ['climate_zone', 'drive_side', 'elevation_reg', 'population_reg',
            'temp_avg_reg', 'temp_diff_reg', 'prec_avg_reg', 'prec_diff_reg']
-    keep += [c for c in aux if c in meta.columns]
+    # month is OSV-5M-only (MP-16-Pro has none); training never reads it
+    keep = [c for c in keep + aux if c in meta.columns]
     meta[keep].to_csv(os.path.join(args.out, 'index.csv'), index=False)
 
     n = len(meta)
