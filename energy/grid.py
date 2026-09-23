@@ -10,9 +10,14 @@ avoids polygon rasterization entirely.
 Samplers are injectable callables (lats, lngs) -> values so the table builder
 is testable without raster files on disk.
 
+The same rasters are also written as lat/lng fields (--fields-out): each
+GeoTIFF reprojected straight onto an equirectangular pixel grid, for
+point lookups off the cell grid (energy.fields.RasterFields).
+
 Usage (run from the repository root, after get_auxiliary_data.sh):
 
-    python -m energy.grid --out data/energy/grid.npz [--resolution 4]
+    python -m energy.grid --out data/energy/grid.npz [--resolution 4] \
+        [--fields-out data/energy/fields.npz [--fields-res 0.1] [--fields-only]]
 """
 
 import sys
@@ -275,6 +280,76 @@ class RasterioSampler:
         return vals
 
 
+def build_field(sampler: RasterioSampler, agg: str, res_deg: float) -> np.ndarray:
+    """Reprojects a raster onto the equirectangular field grid (see
+    energy.fields for the pixel convention), aggregating over each output
+    pixel: GDAL mode resampling for categorical rasters, average for
+    continuous ones — the per-pixel analogue of aggregate_over_cells.
+
+    Args:
+        sampler (RasterioSampler): the source raster (its nodata and
+            transform_value apply exactly as for point sampling)
+        agg (str): 'modal' or 'mean'
+        res_deg (float): output pixel size in degrees
+
+    Returns:
+        np.ndarray: [180/res, 360/res] float32, NaN = no data
+    """
+    import rasterio
+    from rasterio.warp import reproject, Resampling
+    from rasterio.transform import from_origin
+
+    resampling = {'modal': Resampling.mode, 'mean': Resampling.average}[agg]
+    H, W = round(180 / res_deg), round(360 / res_deg)
+    out = np.full((H, W), np.nan, dtype=np.float32)
+    reproject(source=rasterio.band(sampler.dataset, sampler.band), destination=out,
+              src_nodata=sampler.nodata, dst_transform=from_origin(-180, 90, res_deg, res_deg),
+              dst_crs='EPSG:4326', dst_nodata=np.nan, resampling=resampling)
+
+    if sampler.transform_value is not None:
+        valid = ~np.isnan(out)
+        out[valid] = sampler.transform_value(out[valid])
+    return out
+
+
+def build_fields(specs: dict, res_deg: float) -> dict:
+    """Builds every raster in specs as a field: name -> [H, W] float32."""
+    fields = {}
+    for name, (factory, agg) in specs.items():
+        logger.info(f'Reprojecting raster to a {res_deg} deg field: {name} ({agg}).')
+        fields[name] = build_field(factory(), agg, res_deg)
+        logger.info(f'{name}: {np.isnan(fields[name]).mean():.1%} of pixels with no data.')
+    return fields
+
+
+def compare_fields_to_table(fields: dict, res_deg: float, latlngs: np.ndarray,
+                            table: dict) -> None:
+    """Logs how well the fields reproduce the grid table at cell centroids.
+
+    They are not expected to match exactly — the table aggregates over the
+    whole cell, a field over one pixel — but a categorical agreement far
+    below ~90% or a low correlation means the two builds disagree about the
+    raster (wrong nodata, CRS, or value shift), not just about resolution.
+    """
+    import torch
+    from energy.fields import RasterFields
+
+    rf = RasterFields(fields, res_deg)
+    pts = torch.from_numpy(np.asarray(latlngs, dtype=np.float32))
+    for name in sorted(set(fields) & set(table)):
+        mode = 'nearest' if name == 'climate' else 'bilinear'
+        at = rf.sample(name, pts, mode).numpy().astype(np.float64)
+        ref = np.asarray(table[name], dtype=np.float64)
+        both = ~np.isnan(at) & ~np.isnan(ref)
+        coverage = both.sum() / max((~np.isnan(ref)).sum(), 1)
+        if mode == 'nearest':
+            score = f'class agreement {(at[both] == ref[both]).mean():.1%}'
+        else:
+            score = f'correlation {np.corrcoef(at[both], ref[both])[0, 1]:.3f}'
+        logger.info(f'field vs table, {name}: {score} over {both.sum()} cells '
+                    f'(field has data at {coverage:.1%} of the table\'s valid cells).')
+
+
 def default_raster_specs():
     """The raster table schema: name -> (sampler factory, aggregation).
 
@@ -331,6 +406,15 @@ def main():
                       help='Path to WorldClim annual precipitation GeoTIFF.')
     argp.add_argument('--elevation', default=None,
                       help='Path to a global elevation GeoTIFF (e.g. GMTED2010).')
+    argp.add_argument('--fields-out', default=None,
+                      help='Also write every raster as a lat/lng field (energy.fields) '
+                           'to this npz, for point lookups off the cell grid.')
+    argp.add_argument('--fields-res', type=float, default=0.1,
+                      help='Field pixel size in degrees (0.1 = ~11 km, 1800x3600 '
+                           'float32 = 26 MB per raster).')
+    argp.add_argument('--fields-only', action='store_true', default=False,
+                      help='Build only --fields-out, not the grid table (which '
+                           'must already exist at --out for the agreement check).')
     args = argp.parse_args()
 
     cells, latlngs = build_grid(args.resolution)
@@ -343,17 +427,28 @@ def main():
     if args.elevation:
         specs['elevation'] = (lambda: RasterioSampler(args.elevation), 'mean')
 
-    table = build_table(cells, args.resolution, specs)
-
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    np.savez_compressed(
-        args.out,
-        cells=np.array([str(c) for c in cells]),
-        latlngs=latlngs,
-        resolution=args.resolution,
-        **{f'raster_{k}': v for k, v in table.items()},
-    )
-    logger.info(f'Saved grid + raster table to {args.out}.')
+    if args.fields_only:
+        data = np.load(args.out, allow_pickle=False)
+        table = {k[len('raster_'):]: data[k] for k in data.files if k.startswith('raster_')}
+    else:
+        table = build_table(cells, args.resolution, specs)
+        np.savez_compressed(
+            args.out,
+            cells=np.array([str(c) for c in cells]),
+            latlngs=latlngs,
+            resolution=args.resolution,
+            **{f'raster_{k}': v for k, v in table.items()},
+        )
+        logger.info(f'Saved grid + raster table to {args.out}.')
+
+    if args.fields_out:
+        fields = build_fields(specs, args.fields_res)
+        compare_fields_to_table(fields, args.fields_res, latlngs, table)
+        os.makedirs(os.path.dirname(args.fields_out), exist_ok=True)
+        np.savez_compressed(args.fields_out, res_deg=args.fields_res,
+                            **{f'field_{k}': v for k, v in fields.items()})
+        logger.info(f'Saved {len(fields)} fields to {args.fields_out}.')
 
 
 if __name__ == '__main__':

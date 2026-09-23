@@ -34,7 +34,8 @@ haversine-smoothed soft labels) used as a same-data control.
 sh get_rasters.sh                      # Köppen + GHSL rasters
 python osv5m.py all                    # download OSV-5M, build metadata CSV
 python -m energy.grid --out data/energy/grid.npz \
-    --worldclim-tavg ... --worldclim-prec ... --elevation ...
+    --worldclim-tavg ... --worldclim-prec ... --elevation ... \
+    --fields-out data/energy/fields.npz   # lat/lng fields for off-grid lookups
 PIGEON_CLIP_MODEL=geolocal/StreetCLIP python -m energy.embed_cache
 python -m energy.train --run-name stage_a                 # Stage A
 python -m energy.train --run-name 0a_prime --contrastive  # ablation 0a'
