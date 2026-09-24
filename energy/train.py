@@ -110,6 +110,9 @@ def main():
                            'exclusive with --init-from.')
     argp.add_argument('--eval-samples', type=int, default=20000,
                       help='Val rows used for the per-epoch metric pass.')
+    argp.add_argument('--seed', type=int, default=330,
+                      help='Seed for the epoch permutation and parameter init '
+                           '(multi-seed runs for error bars).')
     argp.add_argument('--wandb', action='store_true', default=False,
                       help='Log training curves to Weights & Biases.')
     argp.add_argument('--wandb-project', default='spherical-pigeon')
@@ -125,6 +128,7 @@ def main():
 
     device = pick_device()
     logger.info(f'Device: {device}.')
+    torch.manual_seed(args.seed)
 
     wandb_run = None
     if args.wandb:
@@ -169,9 +173,21 @@ def main():
         raise SystemExit('--init-from and --resume are mutually exclusive.')
     if args.init_from:
         state = torch.load(args.init_from, map_location=device)
-        missing, unexpected = model.load_state_dict(state['model'], strict=False)
+        src = state['model']
+        own = model.state_dict()
+        # strict=False only tolerates missing/unexpected KEYS, not a shape
+        # mismatch on a shared one — it still raises. Stage chaining changes
+        # shapes on purpose (e.g. --masks 1 -> 16 grows image_tower.mask_logits
+        # from [1, d] to [16, d]), so drop those and let the fresh __init__
+        # value stand (mask_logits starts near-identical across masks by
+        # design, exactly the sane default for a newly split mask).
+        resized = [k for k in src if k in own and src[k].shape != own[k].shape]
+        for k in resized:
+            del src[k]
+        missing, unexpected = model.load_state_dict(src, strict=False)
         logger.info(f'Initialized from {args.init_from} '
-                    f'(missing: {len(missing)}, unexpected: {len(unexpected)}).')
+                    f'(missing: {len(missing)}, unexpected: {len(unexpected)}, '
+                    f'resized-and-skipped: {resized}).')
 
     # Fixed RFF encoding of the grid — precomputed once (centroids never move);
     # the location-tower MLP on top still runs in-graph every step.
@@ -193,7 +209,7 @@ def main():
     train_latlng_np = index[['lat', 'lng']].values.astype(np.float32)
     train_cells_np = index['cell_idx'].values
 
-    rng = np.random.default_rng(330)
+    rng = np.random.default_rng(args.seed)
     global_step = 0
     history = []
     best_metric = math.inf  # lowest val median_km so far; {run_name}.pt tracks it
@@ -225,6 +241,7 @@ def main():
     elif args.resume:
         logger.info(f'--resume {args.resume} not found; starting a fresh run.')
 
+    nonfinite_streak = 0
     for epoch in range(start_epoch, args.epochs):
         model.train()
         order = rng.permutation(splits['train'])
@@ -257,6 +274,32 @@ def main():
                     loss = loss + warm * args.mu_conf * regs['confidence'] \
                                 + warm * args.mu_bal * regs['balance'] \
                                 + args.mu_l1 * regs['l1']
+
+            if not torch.isfinite(loss):
+                # A single bad batch (a head whose variance collapsed toward
+                # 0, an extreme-cardinality sparse category, etc.) otherwise
+                # back-propagates NaN through the SHARED image/location
+                # towers and permanently poisons every parameter in one
+                # step — confirmed the hard way: stage_b_geo_full's whole
+                # model, including h_norm (the tripwire this diagnostic
+                # exists for), went NaN one step into epoch 1, with no
+                # per-term isolation possible after the fact (2026-09-08).
+                # Skipping the update on a non-finite loss is cheap
+                # insurance; repeated non-finite losses still fail loudly
+                # rather than silently limping through a broken run.
+                nonfinite_streak += 1
+                logger.warning(f'epoch {epoch} step {global_step}: non-finite loss '
+                               f'({loss.item()}), skipping this update '
+                               f'(streak: {nonfinite_streak}).')
+                if nonfinite_streak >= 20:
+                    raise RuntimeError(
+                        f'{nonfinite_streak} consecutive non-finite losses — '
+                        f'this is a real divergence, not a one-off bad batch. '
+                        f'Check for a term whose head variance/logits can '
+                        f'blow up (e.g. a very sparse categorical raster).')
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            nonfinite_streak = 0
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
