@@ -73,6 +73,12 @@ def load_cache(cache_dir: str):
 def main():
     argp = argparse.ArgumentParser(description='Train the coarse energy model.')
     argp.add_argument('--cache', default='data/energy/cache')
+    argp.add_argument('--exclude-ids', default=None,
+                      help='File of training ids, one per line, to drop from the '
+                           'TRAIN split — energy.overlap writes one as '
+                           'exclude_ids.txt. The ids must be in this cache\'s own '
+                           'id space: the combined OSV+MP-16 cache prefixes MP-16 '
+                           'ids with "mp16_", so it needs the prefixed list.')
     argp.add_argument('--grid', default='data/energy/grid.npz')
     argp.add_argument('--out', default='saved_models/energy')
     argp.add_argument('--run-name', default='stage_a')
@@ -165,6 +171,30 @@ def main():
     splits = {name: np.flatnonzero((index['selection'] == name).values)
               for name in ['train', 'val']}
     logger.info(f"Rows: train {len(splits['train'])}, val {len(splits['val'])}.")
+
+    if args.exclude_ids:
+        if not os.path.exists(args.exclude_ids):
+            raise SystemExit(f'--exclude-ids {args.exclude_ids} not found. It is '
+                             f'written by energy.overlap; run that first rather '
+                             f'than training on an unchecked corpus.')
+        with open(args.exclude_ids) as fh:
+            drop = {line.strip() for line in fh if line.strip()}
+        # TRAIN only. val/test are this corpus's own held-out rows, scored
+        # against this corpus — a row that also appears in an external
+        # benchmark is leakage only if the model was fit on it.
+        keep = ~index['id'].isin(drop).values
+        before = len(splits['train'])
+        splits['train'] = splits['train'][keep[splits['train']]]
+        dropped = before - len(splits['train'])
+        logger.info(f'--exclude-ids {args.exclude_ids}: {len(drop)} ids listed, '
+                    f'{dropped} of {before} train rows dropped.')
+        if drop and not dropped:
+            # Silently matching nothing is the dangerous failure here: the run
+            # looks clean and trains on every leaked row. Usually an id-space
+            # mismatch (the combined cache's "mp16_" prefix).
+            raise SystemExit(f'--exclude-ids listed {len(drop)} ids but none matched '
+                             f'a row in {args.cache}. Check the id space matches '
+                             f'this cache before training.')
 
     # Model
     model = EnergyModel(in_dim=embeddings.shape[1], d=args.d, n_masks=args.masks,
