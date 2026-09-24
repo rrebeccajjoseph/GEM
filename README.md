@@ -55,13 +55,16 @@ python osv5m.py all                    # download OSV-5M, build metadata CSV
 python -m energy.grid --out data/energy/grid.npz \
     --worldclim-tavg ... --worldclim-prec ... --elevation ... \
     --fields-out data/energy/fields.npz   # lat/lng fields for off-grid lookups
+python -m energy.maps --grid data/energy/grid.npz --out-grid data/energy/grid_maps.npz \
+    --fields data/energy/fields.npz       # country/region/drive_side/coast_km from maps
 PIGEON_CLIP_MODEL=geolocal/StreetCLIP python -m energy.embed_cache
 python -m energy.train --run-name stage_a                 # Stage A
 python -m energy.train --run-name 0a_prime --contrastive  # ablation 0a'
 python -m energy.train --run-name a3 --smooth-tau 65      # ablation A3
 python -m energy.train --run-name stage_b --rasters --init-from saved_models/energy/stage_a.pt
 python -m energy.train --run-name stage_b_cont --rasters --gate --continuous \
-    --fields data/energy/fields.npz --init-from saved_models/energy/stage_a.pt  # cell-free B
+    --grid data/energy/grid_maps.npz --fields data/energy/fields.npz \
+    --init-from saved_models/energy/stage_a.pt                   # cell-free B
 python -m energy.finetune_encoder --init-from saved_models/energy/stage_b.pt  # Stage C
 python -m energy.train --run-name stage_d --rasters --masks 16 --season \
     --checkpoint-chunks --init-from saved_models/energy/stage_c.pt

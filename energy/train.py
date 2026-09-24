@@ -59,14 +59,30 @@ def pick_device() -> str:
 
 
 def load_grid(grid_path: str, want_rasters: bool):
-    """Loads the grid npz; returns (latlngs [G,2], resolution, raster_table|None)."""
+    """Loads the grid npz; returns (latlngs [G,2], resolution, raster_table|None).
+
+    A categorical raster with a saved label list (categories_<name>, written
+    by energy.maps) comes back as (values, n_classes): its head must be
+    sized by the full label set, not by the largest code that happens to
+    win some cell, or classes too small for any cell would be dropped when
+    sampled at points.
+    """
     data = np.load(grid_path, allow_pickle=False)
     latlngs = data['latlngs']
     resolution = int(data['resolution'])
     table = None
     if want_rasters:
-        table = {k[len('raster_'):]: data[k] for k in data.files
-                 if k.startswith('raster_')}
+        table = {}
+        for k in data.files:
+            if not k.startswith('raster_'):
+                continue
+            name = k[len('raster_'):]
+            table[name] = data[k]
+            if f'categories_{name}' in data.files:
+                try:
+                    table[name] = (data[k], len(data[f'categories_{name}']))
+                except ValueError:
+                    pass  # pickled object labels (nc/build_geo_rasters.py): size from data
         if not table:
             raise ValueError(f'--rasters given but {grid_path} has no raster_* arrays.')
     return latlngs, resolution, table
