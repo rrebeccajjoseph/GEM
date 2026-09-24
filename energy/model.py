@@ -190,10 +190,14 @@ class DriveSideHead(nn.Module):
 
 
 class RasterBank(nn.Module):
-    """All raster compatibility terms, evaluated against the [G, K] table.
+    """All raster compatibility terms, evaluated against the [G, K] table or
+    against values sampled at arbitrary points (RasterFields).
 
     Continuous rasters are normalized to zero-mean unit-var over valid (land)
-    cells at load time; log1p is applied to precip and popdens first.
+    cells at load time; log1p is applied to precip and popdens first. The
+    normalization stats come from the grid table and are reused for point
+    samples (normalize), so a field value and a table value mean the same
+    thing to the heads — build the model from the same --grid it trained on.
     """
 
     LOG1P = {'precip', 'popdens'}
@@ -222,42 +226,107 @@ class RasterBank(nn.Module):
         super().__init__()
         self.names = sorted(table.keys())
         self.heads = nn.ModuleDict()
+        self.kinds = {}     # name -> 'categorical' | 'drive_side' | 'gaussian'
+        self.n_classes = {}
+        self.stats = {}     # name -> (mean, std) of the transformed raster
 
         for name in self.names:
             raw = np.asarray(table[name], dtype=np.float64).copy()
             valid = ~np.isnan(raw)
 
             if name in self.CATEGORICAL_FIXED or name in self.CATEGORICAL_FROM_DATA:
-                cls = np.where(valid, raw, 0).astype(np.int64)
-                n_classes = self.CATEGORICAL_FIXED.get(name) or int(raw[valid].max()) + 1
-                self.register_buffer(f'values_{name}', torch.from_numpy(cls))
+                self.kinds[name] = 'categorical'
+                self.n_classes[name] = self.CATEGORICAL_FIXED.get(name) or int(raw[valid].max()) + 1
                 # ClimateHead is a generic categorical compatibility head —
                 # softmax over whatever classes it's given — reused as-is for
                 # country/region rather than duplicating it.
-                self.heads[name] = ClimateHead(in_dim, n_classes=n_classes)
+                self.heads[name] = ClimateHead(in_dim, n_classes=self.n_classes[name])
             elif name == 'drive_side':
-                vals = np.where(valid, raw, 0.0).astype(np.float32)
-                self.register_buffer(f'values_{name}', torch.from_numpy(vals))
+                self.kinds[name] = 'drive_side'
                 self.heads[name] = DriveSideHead(in_dim)
             else:
+                self.kinds[name] = 'gaussian'
                 if name in self.LOG1P:
                     raw[valid] = np.log1p(np.maximum(raw[valid], 0.0))
-                mean, std = raw[valid].mean(), raw[valid].std() + 1e-8
-                vals = np.where(valid, (raw - mean) / std, 0.0).astype(np.float32)
-                self.register_buffer(f'values_{name}', torch.from_numpy(vals))
+                self.stats[name] = (float(raw[valid].mean()), float(raw[valid].std() + 1e-8))
                 self.heads[name] = GaussianHead(in_dim, heavy_tailed=name in self.HEAVY)
 
-            self.register_buffer(f'valid_{name}', torch.from_numpy(valid))
+            values, valid_t = self.normalize(name, torch.from_numpy(
+                np.asarray(table[name], dtype=np.float64)))
+            self.register_buffer(f'values_{name}', values)
+            self.register_buffer(f'valid_{name}', valid_t)
 
-    def forward(self, f: Tensor, grid_slice: slice=None) -> Tensor:
-        """Summed raster logits [B, G(slice)]."""
-        total = None
+    def normalize(self, name: str, raw: Tensor) -> tuple:
+        """Raw raster values (NaN = no data) -> (head-ready values, valid).
+
+        The one transform both the grid table and point samples go through.
+        A categorical code outside the head's class range (a field built
+        from a different source than the table) is marked invalid rather
+        than indexed out of bounds.
+
+        Args:
+            name (str): raster name
+            raw (Tensor): raw values [N], any float dtype
+
+        Returns:
+            tuple: (values [N] int64 for categorical, float32 otherwise;
+                    valid [N] bool)
+        """
+        valid = ~torch.isnan(raw)
+        kind = self.kinds[name]
+        if kind == 'categorical':
+            cls = torch.where(valid, raw, torch.zeros_like(raw)).long()
+            valid = valid & (cls >= 0) & (cls < self.n_classes[name])
+            return torch.where(valid, cls, torch.zeros_like(cls)), valid
+        if kind == 'drive_side':
+            return torch.where(valid, raw, torch.zeros_like(raw)).float(), valid
+
+        x = raw
+        if name in self.LOG1P:
+            x = torch.log1p(torch.clamp(x, min=0.0))
+        mean, std = self.stats[name]
+        x = (x - mean) / std
+        return torch.where(valid, x, torch.zeros_like(x)).float(), valid
+
+    def lookup(self, grid_slice: slice=None) -> dict:
+        """Normalized table values over (a slice of) the grid:
+        name -> (values [G(slice)], valid [G(slice)])."""
+        out = {}
         for name in self.names:
             values = getattr(self, f'values_{name}')
             valid = getattr(self, f'valid_{name}')
             if grid_slice is not None:
                 values, valid = values[grid_slice], valid[grid_slice]
-            term = self.heads[name](f, values, valid)
+            out[name] = (values, valid)
+        return out
+
+    def at_points(self, fields, latlng: Tensor) -> dict:
+        """Normalized values sampled from RasterFields at points:
+        name -> (values [N], valid [N]). Categorical and drive-side rasters
+        sample nearest, continuous ones bilinear.
+
+        Args:
+            fields (RasterFields): must hold a field for every raster here
+            latlng (Tensor): degrees [N, 2]
+        """
+        missing = [n for n in self.names if n not in fields]
+        if missing:
+            raise KeyError(f'No field for rasters {missing}; rebuild with '
+                           f'python -m energy.grid --fields-out.')
+        out = {}
+        for name in self.names:
+            mode = 'bilinear' if self.kinds[name] == 'gaussian' else 'nearest'
+            out[name] = self.normalize(name, fields.sample(name, latlng, mode))
+        return out
+
+    def forward(self, f: Tensor, grid_slice: slice=None, values: dict=None) -> Tensor:
+        """Summed raster logits [B, N]: over (a slice of) the grid table, or
+        over explicit points when `values` (from at_points) is given."""
+        if values is None:
+            values = self.lookup(grid_slice)
+        total = None
+        for name in self.names:
+            term = self.heads[name](f, *values[name])
             total = term if total is None else total + term
         return total
 
@@ -313,26 +382,30 @@ class EnergyModel(nn.Module):
         return torch.einsum('bmd,gd->bmg', img_emb, loc_emb) / math.sqrt(self.d)
 
     def neg_free_energy(self, f: Tensor, loc_emb: Tensor,
-                        grid_slice: slice=None) -> Tensor:
-        """-F(x, y) over (a slice of) the grid: [B, G(slice)].
+                        grid_slice: slice=None, raster_values: dict=None) -> Tensor:
+        """-F(x, y) over (a slice of) the grid, or over arbitrary points:
+        [B, N].
+
+        loc_emb rows are the points. By default the raster terms come from
+        the grid table (grid_slice picks the rows matching loc_emb); pass
+        raster_values = self.rasters.at_points(fields, latlng) instead when
+        the points are not grid centroids.
 
         p(y|x) = softmax over the grid of this quantity. The uniform priors
         over m and s contribute constants absorbed by normalization.
         """
         img_emb = self.image_tower(f)                       # [B, M, d]
-        logits = self.vis_logits(img_emb, loc_emb)          # [B, M, G]
+        logits = self.vis_logits(img_emb, loc_emb)          # [B, M, N]
         neg_f = torch.logsumexp(logits, dim=1)              # marginalize m
 
         if self.rasters is not None:
-            neg_f = neg_f + self.rasters(f, grid_slice)
+            if raster_values is None:
+                raster_values = self.rasters.lookup(grid_slice)
+            neg_f = neg_f + self.rasters(f, values=raster_values)
 
         if self.season is not None:
-            climate_idx = self.rasters.values_climate
-            climate_valid = self.rasters.valid_climate
-            if grid_slice is not None:
-                climate_idx = climate_idx[grid_slice]
-                climate_valid = climate_valid[grid_slice]
-            s_logits = self.season(f, climate_idx, climate_valid)  # [B, T, G]
+            climate_idx, climate_valid = raster_values['climate']
+            s_logits = self.season(f, climate_idx, climate_valid)  # [B, T, N]
             neg_f = neg_f + torch.logsumexp(s_logits, dim=1) - math.log(s_logits.shape[1])
 
         return neg_f
