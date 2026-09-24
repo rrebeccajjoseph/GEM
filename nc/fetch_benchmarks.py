@@ -101,7 +101,11 @@ def main():
         reg[f'{name}_full'] = {'meta': meta, 'images': out}
         print(f'{name}: {len(got)}/{len(body)} images ({len(got) / len(body):.1%}) '
               f'in {time.time() - t0:.0f}s -> {avail}')
-    json.dump(reg, open(path, 'w'), indent=2)
+    # merge into the file as it is NOW: other pipeline steps (the OSV-5M test
+    # entry) register benchmarks while this one runs for minutes
+    current = json.load(open(path)) if os.path.exists(path) else {}
+    current.update({k: v for k, v in reg.items() if k.startswith(('im2gps3k', 'yfcc4k'))})
+    json.dump(current, open(path, 'w'), indent=2)
 
 
 if __name__ == '__main__':
