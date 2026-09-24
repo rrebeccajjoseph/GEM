@@ -31,6 +31,7 @@ import logging
 import argparse
 import numpy as np
 import pandas as pd
+from val_split import spatial_val_split
 from config import OSV5M_HF_REPO, OSV5M_ROOT, METADATA_PATH_OSV, \
                    IMAGE_PATH_OSV, KOPPEN_GEIGER_PATH
 
@@ -125,10 +126,8 @@ def adapt(val_size: int=10000, seed: int=330) -> None:
 
     data = pd.concat(frames, ignore_index=True)
 
-    train_idx = data.index[data['selection'] == 'train']
-    rng = np.random.default_rng(seed)
-    val_idx = rng.choice(train_idx, size=min(val_size, len(train_idx)), replace=False)
-    data.loc[val_idx, 'selection'] = 'val'
+    # spatially held out, like OSV-5M's own test split (see val_split.py)
+    data['selection'] = spatial_val_split(data, val_size, seed=seed)
 
     os.makedirs(os.path.dirname(METADATA_PATH_OSV), exist_ok=True)
     data.to_csv(METADATA_PATH_OSV, index=False)

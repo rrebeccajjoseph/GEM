@@ -36,6 +36,7 @@ import logging
 import argparse
 import numpy as np
 import pandas as pd
+from val_split import spatial_val_split
 from config import MP16_HF_REPO, MP16_ROOT, METADATA_PATH_MP16, IMAGE_PATH_MP16
 
 logger = logging.getLogger('mp16')
@@ -148,10 +149,9 @@ def adapt(val_frac: float=0.01, seed: int=330) -> None:
         df = df[df['image'].isin(present)]
     df['id'] = df['image'].str.rsplit('.', n=1).str[0]
 
-    rng = np.random.default_rng(seed)
     df['selection'] = 'train'
-    val_idx = rng.choice(df.index, size=int(len(df) * val_frac), replace=False)
-    df.loc[val_idx, 'selection'] = 'val'
+    # spatially held out: Flickr bursts leak across a random split (see val_split.py)
+    df['selection'] = spatial_val_split(df, int(len(df) * val_frac), seed=seed)
 
     os.makedirs(os.path.dirname(METADATA_PATH_MP16), exist_ok=True)
     df[['image', 'lat', 'lng', 'selection', 'id', 'country', 'region', 'scene',
