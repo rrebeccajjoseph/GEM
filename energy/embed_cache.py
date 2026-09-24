@@ -53,7 +53,10 @@ class ImageDataset(torch.utils.data.Dataset):
         return len(self.paths)
 
     def __getitem__(self, idx):
-        from PIL import Image
+        from PIL import Image, ImageFile
+        # A handful of benchmark images (esp. YFCC26k) download with a few
+        # trailing bytes missing; load them anyway rather than crash the run.
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
         image = Image.open(self.paths[idx]).convert('RGB')
         pixels = self.processor(images=image, return_tensors='pt')['pixel_values']
         return pixels.squeeze(0)

@@ -46,16 +46,18 @@ def distance_metrics(pred_latlng: np.ndarray, true_latlng: np.ndarray) -> dict:
     return out
 
 
-def calibration_metrics(log_p: Tensor, pred_latlng: np.ndarray,
+def calibration_metrics(entropy: np.ndarray, pred_latlng: np.ndarray,
                         true_latlng: np.ndarray, n_bins: int=10) -> dict:
     """Entropy-binned calibration: does predictive entropy rank error?
 
     Reports mean geodesic error per entropy bin and the Spearman rank
-    correlation between per-sample entropy and error.
+    correlation between per-sample entropy and error. `entropy` is the
+    per-row predictive entropy (computed streaming by evaluate_on_cache so
+    the full [N, |G|] log_p is never materialized).
     """
     from scipy.stats import spearmanr
 
-    entropy = (-(log_p.exp() * log_p).sum(dim=1)).cpu().numpy()
+    entropy = np.asarray(entropy)
     dists = haversine_km(pred_latlng, true_latlng)
 
     order = np.argsort(entropy)
@@ -73,17 +75,20 @@ def evaluate_on_cache(model, embeddings: Tensor, latlngs: np.ndarray,
                       batch_size: int=256, device: str='cpu') -> dict:
     """Runs the full metric suite over a cached-embedding split."""
     model.eval()
-    all_logp, all_pred = [], []
+    all_entropy, all_pred = [], []
     for start in range(0, len(embeddings), batch_size):
         f = embeddings[start:start + batch_size].to(device)
         log_p, pred_idx = predict(model, f, grid_rff)
-        all_logp.append(log_p.cpu())
+        # Reduce to per-row entropy here — keeping every batch's full
+        # [B, |G|] log_p and concatenating OOMs on big benchmarks (YFCC26k
+        # is 21.5k rows x 288k cells ~= 25 GB per copy).
+        all_entropy.append((-(log_p.exp() * log_p).sum(dim=1)).cpu().numpy())
         all_pred.append(pred_idx)
 
-    log_p = torch.cat(all_logp, dim=0)
+    entropy = np.concatenate(all_entropy)
     pred_idx = np.concatenate(all_pred)
     pred_latlng = grid_latlngs[pred_idx]
 
     metrics = distance_metrics(pred_latlng, latlngs)
-    metrics.update(calibration_metrics(log_p, pred_latlng, latlngs))
+    metrics.update(calibration_metrics(entropy, pred_latlng, latlngs))
     return metrics
