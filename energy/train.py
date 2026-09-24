@@ -99,6 +99,10 @@ def load_cache(cache_dir: str):
 def main():
     argp = argparse.ArgumentParser(description='Train the coarse energy model.')
     argp.add_argument('--cache', default='data/energy/cache')
+    argp.add_argument('--max-rows', type=int, default=None,
+                      help='Train on a seeded random subset of this many train rows. '
+                           'For short trial runs; val is '
+                           'untouched so trial metrics stay comparable.')
     argp.add_argument('--grid', default='data/energy/grid.npz')
     argp.add_argument('--out', default='saved_models/energy')
     argp.add_argument('--run-name', default='stage_a')
@@ -217,6 +221,11 @@ def main():
               for name in ['train', 'val']}
     logger.info(f"Rows: train {len(splits['train'])}, val {len(splits['val'])}.")
 
+    if args.max_rows and args.max_rows < len(splits['train']):
+        sub_rng = np.random.default_rng(args.seed)
+        splits['train'] = np.sort(sub_rng.choice(splits['train'], args.max_rows, replace=False))
+        logger.info(f'--max-rows: training on {len(splits["train"])} sampled rows.')
+
     # Model
     if args.gate and not args.rasters:
         raise SystemExit('--gate gates the raster terms; it needs --rasters.')
@@ -317,6 +326,7 @@ def main():
         model.train()
         order = rng.permutation(splits['train'])
         epoch_loss, epoch_n = 0.0, 0
+        epoch_ess_p10 = []  # continuous only: per-step 10th-percentile ESS
 
         for start in range(0, len(order), args.batch_size):
             rows = order[start:start + args.batch_size]
@@ -388,6 +398,8 @@ def main():
             scheduler.step()
 
             epoch_loss += loss.item() * len(rows)
+            if ess is not None:
+                epoch_ess_p10.append(float(ess.quantile(0.1)))
             epoch_n += len(rows)
             global_step += 1
 
@@ -438,6 +450,11 @@ def main():
                                     fields=fields)
         model.train()
 
+        if epoch_ess_p10:
+            # the spike tripwire, kept in the history too (not only W&B): a
+            # quadrature whose importance weights collapse onto a few nodes
+            diag['ess_p10_median'] = float(np.median(epoch_ess_p10))
+            diag['ess_p10_min'] = float(np.min(epoch_ess_p10))
         record = {'epoch': epoch, 'train_loss': train_loss, **diag,
                   **{k: v for k, v in metrics.items() if not isinstance(v, list)}}
         history.append(record)
