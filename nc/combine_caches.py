@@ -17,7 +17,7 @@ e = np.lib.format.open_memmap(f'{out}/embeddings.f16.npy', mode='w+', dtype=np.f
                               shape=(len(ea) + len(eb), ea.shape[1]))
 step = 1 << 20
 for s in range(0, len(ea), step):
-    e[s:s + step] = ea[s:s + step]
+    e[s:min(s + step, len(ea))] = ea[s:s + step]
 for s in range(0, len(eb), step):
     e[len(ea) + s:len(ea) + s + step] = eb[s:s + step]
 e.flush()
