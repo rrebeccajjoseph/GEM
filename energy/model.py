@@ -198,6 +198,20 @@ class RasterBank(nn.Module):
 
     LOG1P = {'precip', 'popdens'}
     HEAVY = {'popdens'}
+    # Fixed-cardinality categorical rasters (Köppen's 30 classes are a stable
+    # external standard, hence the one hardcoded count) vs data-derived ones
+    # (country/region: whatever aggregate_labels_over_cells's pd.factorize
+    # found — no external standard to hardcode against, and the count varies
+    # with which datasets were pooled to build the raster).
+    CATEGORICAL_FIXED = {'climate': 30}
+    # subregion/road_index: dash/underscore-normalized and near-discrete
+    # (road_index is stored as float but only ~8 distinct values in the raw
+    # data — a small mode-aggregated category fits it better than a Gaussian
+    # regression head). dist_sea and MP-16's Prob_indoor/natural/urban are
+    # genuinely continuous and need no entry here — they fall through to the
+    # existing GaussianHead branch below, same as temp/precip/elevation.
+    CATEGORICAL_FROM_DATA = {'country', 'region', 'subregion', 'land_cover',
+                             'soil', 'road_index', 'scene'}
 
     def __init__(self, table: dict, in_dim: int=1024):
         """
@@ -213,10 +227,14 @@ class RasterBank(nn.Module):
             raw = np.asarray(table[name], dtype=np.float64).copy()
             valid = ~np.isnan(raw)
 
-            if name == 'climate':
+            if name in self.CATEGORICAL_FIXED or name in self.CATEGORICAL_FROM_DATA:
                 cls = np.where(valid, raw, 0).astype(np.int64)
+                n_classes = self.CATEGORICAL_FIXED.get(name) or int(raw[valid].max()) + 1
                 self.register_buffer(f'values_{name}', torch.from_numpy(cls))
-                self.heads[name] = ClimateHead(in_dim, n_classes=30)
+                # ClimateHead is a generic categorical compatibility head —
+                # softmax over whatever classes it's given — reused as-is for
+                # country/region rather than duplicating it.
+                self.heads[name] = ClimateHead(in_dim, n_classes=n_classes)
             elif name == 'drive_side':
                 vals = np.where(valid, raw, 0.0).astype(np.float32)
                 self.register_buffer(f'values_{name}', torch.from_numpy(vals))

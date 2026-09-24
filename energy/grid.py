@@ -26,6 +26,7 @@ if project_dir not in sys.path:
 import logging
 import argparse
 import numpy as np
+import pandas as pd
 import h3
 
 logger = logging.getLogger('energy.grid')
@@ -84,6 +85,103 @@ def snap_to_grid(lats: np.ndarray, lngs: np.ndarray, resolution: int,
     """
     return np.array([index_map[_to_cell(lat, lng, resolution)]
                      for lat, lng in zip(lats, lngs)], dtype=np.int64)
+
+
+def aggregate_labels_over_cells(cells: list, resolution: int, lats: np.ndarray,
+                                lngs: np.ndarray, labels: np.ndarray) -> tuple:
+    """Builds a per-cell categorical raster from OBSERVED training rows —
+    e.g. country/region, already sitting in per-image metadata (OSV-5M's
+    `country`/`region`/`sub-region`, MP-16-Pro's `country`/`region`), unlike
+    aggregate_over_cells which samples a continuous *external* raster. No
+    geocoding needed: every row already carries its own label, this just
+    votes those labels into the grid.
+
+    A cell with at least one observed row takes the majority label among
+    them. A cell with none (sparse ocean/desert/polar regions, or simply
+    outside every dataset pooled in) is filled from the nearest cell that
+    does have a majority, by cell-centroid distance — the same nearest-fill
+    convention osv5m.py's climate() uses for ocean/nodata Köppen pixels.
+
+    Args:
+        cells: H3 grid cells
+        resolution: grid resolution
+        lats, lngs: observed row coordinates (pool multiple datasets by
+            concatenating before calling — one consistent factorization)
+        labels: observed row labels (any hashable, e.g. country strings)
+
+    Returns:
+        tuple: (raster [G] float64, int-coded with NaN nowhere after fill;
+                categories: list where categories[code] recovers the label)
+    """
+    from scipy.spatial import cKDTree
+
+    idx_map = cell_index_map(cells)
+    pos = snap_to_grid(lats, lngs, resolution, idx_map)
+    codes, categories = pd.factorize(labels)
+
+    G = len(cells)
+    votes = [{} for _ in range(G)]
+    for p, c in zip(pos, codes):
+        if c < 0:  # factorize's code for a missing/NaN label
+            continue
+        votes[p][c] = votes[p].get(c, 0) + 1
+
+    raster = np.full(G, np.nan)
+    has_vote = np.zeros(G, dtype=bool)
+    for g, v in enumerate(votes):
+        if v:
+            raster[g] = max(v, key=v.get)
+            has_vote[g] = True
+
+    n_empty = int((~has_vote).sum())
+    if n_empty:
+        latlngs = np.array([_to_latlng(c) for c in cells])
+        tree = cKDTree(latlngs[has_vote])
+        _, nearest = tree.query(latlngs[~has_vote], k=1)
+        raster[~has_vote] = raster[has_vote][nearest]
+        logger.info(f'{n_empty}/{G} cells had no observed row; filled from '
+                    f'the nearest cell that did.')
+
+    return raster, list(categories)
+
+
+def aggregate_values_over_cells(cells: list, resolution: int, lats: np.ndarray,
+                                lngs: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """Continuous counterpart to aggregate_labels_over_cells: mean of the
+    OBSERVED rows' values per cell (e.g. OSV-5M's dist_sea, MP-16's
+    Prob_indoor/natural/urban), not an external raster sample. Same
+    nearest-fill for cells with no observed row.
+
+    Returns:
+        np.ndarray: raster [G] float64, no NaN after fill.
+    """
+    from scipy.spatial import cKDTree
+
+    idx_map = cell_index_map(cells)
+    pos = snap_to_grid(lats, lngs, resolution, idx_map)
+    values = np.asarray(values, dtype=np.float64)
+
+    G = len(cells)
+    sums = np.zeros(G)
+    counts = np.zeros(G)
+    ok = ~np.isnan(values)
+    np.add.at(sums, pos[ok], values[ok])
+    np.add.at(counts, pos[ok], 1)
+
+    has_val = counts > 0
+    raster = np.full(G, np.nan)
+    raster[has_val] = sums[has_val] / counts[has_val]
+
+    n_empty = int((~has_val).sum())
+    if n_empty:
+        latlngs = np.array([_to_latlng(c) for c in cells])
+        tree = cKDTree(latlngs[has_val])
+        _, nearest = tree.query(latlngs[~has_val], k=1)
+        raster[~has_val] = raster[has_val][nearest]
+        logger.info(f'{n_empty}/{G} cells had no observed row; filled from '
+                    f'the nearest cell that did.')
+
+    return raster
 
 
 def aggregate_over_cells(cells: list, sampler, agg: str, resolution: int,
