@@ -23,3 +23,12 @@ GHSL_PATH = 'data/rasters/pop_density/GHS_POP_E2020_GLOBE_R2022A_54009_1000_V1_0
 
 # Benchmarks: name -> {"meta": csv path, "images": dir}
 BENCHMARKS = 'data/benchmarks/benchmarks.json'
+
+# MP-16-Pro (Jia et al., NeurIPS 2024 "G3") — broad Flickr photography
+# (landmarks, indoor, people, food), unlike OSV-5M's street-level dashcam
+# imagery. Gated on HF: the account whose token sits on this machine must
+# have clicked "Agree and access" on huggingface.co/datasets/Jia-py/MP16-Pro.
+MP16_HF_REPO = 'Jia-py/MP16-Pro'
+MP16_ROOT = 'data/mp16'
+METADATA_PATH_MP16 = 'data/mp16/metadata_mp16.csv'
+IMAGE_PATH_MP16 = 'data/mp16/images'
